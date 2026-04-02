@@ -2,4 +2,4 @@
 
 pub mod context;
 
-pub use context::{GpuContext, OffscreenTarget, WIDTH, HEIGHT, DEPTH_FORMAT};
+pub use context::{DEPTH_FORMAT, GpuContext, HEIGHT, OffscreenTarget, WIDTH};
