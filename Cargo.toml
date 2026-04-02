@@ -23,6 +23,7 @@ codegen-units = 1
 # Kernel crates
 vzglyd-kernel = { path = "../vzglyd-kernel" }
 vzglyd-slide = { git = "https://github.com/vzglyd/vzglyd-slide", features = ["gpu"] }
+vzglyd-sidecar = { path = "../lume-sidecar" }
 
 # Windowing
 winit = "0.30"

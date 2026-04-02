@@ -18,6 +18,7 @@ use vzglyd_kernel::{
     ImportedCameraProjection, ImportedMesh, ImportedScene, ImportedSceneCamera,
     ImportedSceneDirectionalLight, ImportedSceneMeshNode, ImportedVertex,
 };
+use vzglyd_sidecar::host_request;
 use vzglyd_slide::{
     CameraKeyframe, CameraPath, DirectionalLight, DrawSource, DrawSpec, FilterMode, Limits,
     MeshAsset, MeshAssetVertex, PipelineKind, RuntimeMeshSet, RuntimeOverlay, SceneAnchor,
@@ -44,11 +45,8 @@ const HOST_BUFFER_TOO_SMALL: i32 = -2;
 const HOST_CHANNEL_EMPTY: i32 = -3;
 const HOST_ASSET_NOT_FOUND: i32 = -4;
 const WASI_ERRNO_SUCCESS: i32 = 0;
-const WASI_ERRNO_BADF: i32 = 8;
-const WASI_ERRNO_CONNREFUSED: i32 = 14;
 const WASI_ERRNO_FAULT: i32 = 21;
 const WASI_ERRNO_INVAL: i32 = 28;
-const WASI_ERRNO_IO: i32 = 29;
 
 #[derive(Clone, Default)]
 struct HostMeshAssetCatalog {
@@ -102,6 +100,7 @@ impl SlideMailbox {
 /// A byte-message mailbox shared between a sidecar WASM thread and the main slide.
 /// The sidecar overwrites the latest payload; the main slide consumes it once.
 type SlideChannel = Arc<SlideMailbox>;
+type SidecarRequestExecutor = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
 
 struct SlideStore {
     wasi: wasmtime_wasi::WasiCtx,
@@ -111,47 +110,12 @@ struct SlideStore {
     scene_metadata: HostSceneMetadataCatalog,
 }
 
-struct SocketTable {
-    next_fd: i32,
-    sockets: HashMap<i32, std::net::TcpStream>,
-}
-
-impl SocketTable {
-    fn new() -> Self {
-        Self {
-            next_fd: 100,
-            sockets: HashMap::new(),
-        }
-    }
-
-    fn reserve(&mut self) -> i32 {
-        let fd = self.next_fd;
-        self.next_fd += 1;
-        fd
-    }
-
-    fn is_reserved(&self, fd: i32) -> bool {
-        fd >= 100 && fd < self.next_fd
-    }
-
-    fn insert_with_fd(&mut self, fd: i32, stream: std::net::TcpStream) {
-        self.sockets.insert(fd, stream);
-    }
-
-    fn get_mut(&mut self, fd: i32) -> Option<&mut std::net::TcpStream> {
-        self.sockets.get_mut(&fd)
-    }
-
-    fn remove(&mut self, fd: i32) -> Option<std::net::TcpStream> {
-        self.sockets.remove(&fd)
-    }
-}
-
 struct SidecarStore {
     wasi: wasmtime_wasi::WasiCtx,
-    sockets: SocketTable,
     tx: SlideChannel,
     label: String,
+    last_network_response: Vec<u8>,
+    request_executor: SidecarRequestExecutor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,22 +599,6 @@ fn write_guest_bytes<T>(
         .map_err(|_| WASI_ERRNO_FAULT)
 }
 
-fn write_guest_u32<T>(
-    caller: &mut wasmtime::Caller<'_, T>,
-    ptr: i32,
-    value: u32,
-) -> Result<(), i32> {
-    write_guest_bytes(caller, ptr, &value.to_le_bytes())
-}
-
-fn write_guest_u16<T>(
-    caller: &mut wasmtime::Caller<'_, T>,
-    ptr: i32,
-    value: u16,
-) -> Result<(), i32> {
-    write_guest_bytes(caller, ptr, &value.to_le_bytes())
-}
-
 fn read_guest_bytes<T>(
     caller: &mut wasmtime::Caller<'_, T>,
     ptr: i32,
@@ -664,207 +612,10 @@ fn read_guest_bytes<T>(
         .ok_or(WASI_ERRNO_FAULT)
 }
 
-fn read_iovecs<T>(
-    caller: &mut wasmtime::Caller<'_, T>,
-    ptr: i32,
-    len: i32,
-) -> Result<Vec<(usize, usize)>, i32> {
-    let (start, end) = guest_range(ptr, len.checked_mul(8).ok_or(WASI_ERRNO_INVAL)?)?;
-    let memory = caller_memory(caller)?;
-    let data = memory.data(&*caller);
-    let raw = data.get(start..end).ok_or(WASI_ERRNO_FAULT)?;
-    let mut regions = Vec::with_capacity(len as usize);
-    for chunk in raw.chunks_exact(8) {
-        let base_ptr =
-            u32::from_le_bytes(chunk[0..4].try_into().map_err(|_| WASI_ERRNO_FAULT)?) as usize;
-        let base_len =
-            u32::from_le_bytes(chunk[4..8].try_into().map_err(|_| WASI_ERRNO_FAULT)?) as usize;
-        let end = base_ptr.checked_add(base_len).ok_or(WASI_ERRNO_INVAL)?;
-        if data.get(base_ptr..end).is_none() {
-            return Err(WASI_ERRNO_FAULT);
-        }
-        regions.push((base_ptr, base_len));
-    }
-    Ok(regions)
-}
-
-fn register_tcp_extension(linker: &mut wasmtime::Linker<SidecarStore>) -> Result<(), LoadError> {
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "sock_open",
-            |mut caller: wasmtime::Caller<'_, SidecarStore>,
-             _af: i32,
-             _socktype: i32,
-             _proto: i32,
-             fd_out_ptr: i32|
-             -> i32 {
-                let fd = caller.data_mut().sockets.reserve() as u32;
-                match write_guest_u32(&mut caller, fd_out_ptr, fd) {
-                    Ok(()) => WASI_ERRNO_SUCCESS,
-                    Err(errno) => errno,
-                }
-            },
-        )
-        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "sock_connect",
-            |mut caller: wasmtime::Caller<'_, SidecarStore>,
-             fd: i32,
-             addr_ptr: i32,
-             addr_len: i32|
-             -> i32 {
-                if !caller.data().sockets.is_reserved(fd)
-                    || caller.data().sockets.sockets.contains_key(&fd)
-                {
-                    return WASI_ERRNO_BADF;
-                }
-
-                let bytes = match read_guest_bytes(&mut caller, addr_ptr, addr_len) {
-                    Ok(bytes) => bytes,
-                    Err(errno) => return errno,
-                };
-                if bytes.len() < 8 {
-                    return WASI_ERRNO_INVAL;
-                }
-
-                let port = u16::from_be_bytes([bytes[2], bytes[3]]);
-                let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
-                let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port);
-
-                match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-                    Ok(stream) => {
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                        caller.data_mut().sockets.insert_with_fd(fd, stream);
-                        WASI_ERRNO_SUCCESS
-                    }
-                    Err(error) => match error.kind() {
-                        std::io::ErrorKind::ConnectionRefused => WASI_ERRNO_CONNREFUSED,
-                        _ => WASI_ERRNO_IO,
-                    },
-                }
-            },
-        )
-        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "sock_send",
-            |mut caller: wasmtime::Caller<'_, SidecarStore>,
-             fd: i32,
-             si_data_ptr: i32,
-             si_data_len: i32,
-             _si_flags: i32,
-             datalen_out_ptr: i32|
-             -> i32 {
-                use std::io::Write;
-
-                let regions = match read_iovecs(&mut caller, si_data_ptr, si_data_len) {
-                    Ok(regions) => regions,
-                    Err(errno) => return errno,
-                };
-                let bytes = {
-                    let memory = match caller_memory(&mut caller) {
-                        Ok(memory) => memory,
-                        Err(errno) => return errno,
-                    };
-                    let data = memory.data(&caller);
-                    let mut bytes = Vec::new();
-                    for (ptr, len) in regions {
-                        bytes.extend_from_slice(&data[ptr..ptr + len]);
-                    }
-                    bytes
-                };
-
-                let written = match caller.data_mut().sockets.get_mut(fd) {
-                    Some(stream) => match stream.write(&bytes) {
-                        Ok(written) => written as u32,
-                        Err(_) => return WASI_ERRNO_IO,
-                    },
-                    None => return WASI_ERRNO_BADF,
-                };
-
-                match write_guest_u32(&mut caller, datalen_out_ptr, written) {
-                    Ok(()) => WASI_ERRNO_SUCCESS,
-                    Err(errno) => errno,
-                }
-            },
-        )
-        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "sock_recv",
-            |mut caller: wasmtime::Caller<'_, SidecarStore>,
-             fd: i32,
-             ri_data_ptr: i32,
-             ri_data_len: i32,
-             _ri_flags: i32,
-             datalen_out_ptr: i32,
-             roflags_out_ptr: i32|
-             -> i32 {
-                use std::io::Read;
-
-                let regions = match read_iovecs(&mut caller, ri_data_ptr, ri_data_len) {
-                    Ok(regions) => regions,
-                    Err(errno) => return errno,
-                };
-                let total_capacity: usize = regions.iter().map(|(_, len)| *len).sum();
-                let mut buffer = vec![0u8; total_capacity];
-                let received = match caller.data_mut().sockets.get_mut(fd) {
-                    Some(stream) => match stream.read(&mut buffer) {
-                        Ok(received) => received,
-                        Err(_) => return WASI_ERRNO_IO,
-                    },
-                    None => return WASI_ERRNO_BADF,
-                };
-
-                let memory = match caller_memory(&mut caller) {
-                    Ok(memory) => memory,
-                    Err(errno) => return errno,
-                };
-                let mut written = 0usize;
-                for (ptr, len) in regions {
-                    if written >= received {
-                        break;
-                    }
-                    let chunk_len = len.min(received - written);
-                    if memory
-                        .write(&mut caller, ptr, &buffer[written..written + chunk_len])
-                        .is_err()
-                    {
-                        return WASI_ERRNO_FAULT;
-                    }
-                    written += chunk_len;
-                }
-                if write_guest_u32(&mut caller, datalen_out_ptr, received as u32).is_err() {
-                    return WASI_ERRNO_FAULT;
-                }
-                if write_guest_u16(&mut caller, roflags_out_ptr, 0).is_err() {
-                    return WASI_ERRNO_FAULT;
-                }
-                WASI_ERRNO_SUCCESS
-            },
-        )
-        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "sock_shutdown",
-            |mut caller: wasmtime::Caller<'_, SidecarStore>, fd: i32, _how: i32| -> i32 {
-                if let Some(stream) = caller.data_mut().sockets.remove(fd) {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    WASI_ERRNO_SUCCESS
-                } else {
-                    WASI_ERRNO_BADF
-                }
-            },
-        )
-        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
-    Ok(())
+fn default_sidecar_request_executor() -> SidecarRequestExecutor {
+    Arc::new(|request_bytes| {
+        host_request::execute_request_bytes(request_bytes).map_err(|error| error.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -883,6 +634,24 @@ fn load_sidecar_with_config(
     wasi_preopens: &[String],
     runtime_label: &str,
 ) -> Result<SidecarHandle, LoadError> {
+    load_sidecar_with_executor(
+        engine,
+        wasm_bytes,
+        tx,
+        wasi_preopens,
+        runtime_label,
+        default_sidecar_request_executor(),
+    )
+}
+
+fn load_sidecar_with_executor(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+    tx: SlideChannel,
+    wasi_preopens: &[String],
+    runtime_label: &str,
+    request_executor: SidecarRequestExecutor,
+) -> Result<SidecarHandle, LoadError> {
     let module =
         Module::new(engine, wasm_bytes).map_err(|error| LoadError::WasmLoad(error.to_string()))?;
     let engine = engine.clone();
@@ -897,7 +666,14 @@ fn load_sidecar_with_config(
         .name("vzglyd-sidecar".into())
         .spawn(move || {
             log::info!("sidecar:{} thread started", runtime_label);
-            let result = run_sidecar_module(&engine, &module, tx, &wasi_preopens, &runtime_label);
+            let result = run_sidecar_module(
+                &engine,
+                &module,
+                tx,
+                &wasi_preopens,
+                &runtime_label,
+                request_executor,
+            );
             #[cfg(test)]
             if let Err(error) = result {
                 panic!("sidecar thread failed: {error}");
@@ -920,6 +696,7 @@ fn run_sidecar_module(
     tx: SlideChannel,
     wasi_preopens: &[String],
     runtime_label: &str,
+    request_executor: SidecarRequestExecutor,
 ) -> Result<(), LoadError> {
     let mut wasi_builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
     wasi_builder.inherit_stdout().inherit_stderr();
@@ -932,9 +709,10 @@ fn run_sidecar_module(
         engine,
         SidecarStore {
             wasi,
-            sockets: SocketTable::new(),
             tx,
             label: runtime_label.to_string(),
+            last_network_response: Vec::new(),
+            request_executor,
         },
     );
     configure_runtime_store(&mut store);
@@ -942,7 +720,6 @@ fn run_sidecar_module(
     linker.allow_shadowing(true);
     wasmtime_wasi::sync::add_to_linker(&mut linker, |s: &mut SidecarStore| &mut s.wasi)
         .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
-    register_tcp_extension(&mut linker)?;
     linker
         .func_wrap(
             "vzglyd_host",
@@ -988,6 +765,55 @@ fn run_sidecar_module(
             "channel_active",
             |caller: wasmtime::Caller<'_, SidecarStore>| -> i32 {
                 i32::from(caller.data().tx.is_active())
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "network_request",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>, ptr: i32, len: i32| -> i32 {
+                let request_bytes = match read_guest_bytes(&mut caller, ptr, len) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return HOST_ERROR,
+                };
+                let response_bytes = match (caller.data().request_executor)(&request_bytes) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        log::warn!("sidecar:{} host request failed: {error}", caller.data().label);
+                        return HOST_ERROR;
+                    }
+                };
+                caller.data_mut().last_network_response = response_bytes;
+                WASI_ERRNO_SUCCESS
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "network_response_len",
+            |caller: wasmtime::Caller<'_, SidecarStore>| -> i32 {
+                caller.data().last_network_response.len() as i32
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "network_response_read",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>, buf_ptr: i32, buf_len: i32| -> i32 {
+                if buf_ptr < 0 || buf_len < 0 {
+                    return HOST_ERROR;
+                }
+                let response = caller.data().last_network_response.clone();
+                if response.len() > buf_len as usize {
+                    return HOST_BUFFER_TOO_SMALL;
+                }
+                if write_guest_bytes(&mut caller, buf_ptr, &response).is_err() {
+                    return HOST_ERROR;
+                }
+                response.len() as i32
             },
         )
         .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
@@ -3955,6 +3781,42 @@ mod tests {
         wat::parse_str(&wat_src).expect("compile sidecar multi-push WAT to WASM")
     }
 
+    fn make_network_request_sidecar_test_wasm(request_bytes: &[u8]) -> Vec<u8> {
+        let escaped_request: String = request_bytes
+            .iter()
+            .map(|byte| format!("\\{byte:02x}"))
+            .collect();
+        let request_len = request_bytes.len();
+        let wat_src = format!(
+            "(module\n\
+               (import \"vzglyd_host\" \"network_request\" (func $network_request (param i32 i32) (result i32)))\n\
+               (import \"vzglyd_host\" \"network_response_len\" (func $network_response_len (result i32)))\n\
+               (import \"vzglyd_host\" \"network_response_read\" (func $network_response_read (param i32 i32) (result i32)))\n\
+               (import \"vzglyd_host\" \"channel_push\" (func $channel_push (param i32 i32) (result i32)))\n\
+               (memory (export \"memory\") 1)\n\
+               (data (i32.const 0) \"{escaped_request}\")\n\
+               (func (export \"vzglyd_sidecar_run\") (result i32)\n\
+                 (local $len i32)\n\
+                 i32.const 0\n\
+                 i32.const {request_len}\n\
+                 call $network_request\n\
+                 drop\n\
+                 call $network_response_len\n\
+                 local.set $len\n\
+                 i32.const 512\n\
+                 local.get $len\n\
+                 call $network_response_read\n\
+                 drop\n\
+                 i32.const 512\n\
+                 local.get $len\n\
+                 call $channel_push\n\
+                 drop\n\
+                 i32.const 0)\n\
+             )"
+        );
+        wat::parse_str(&wat_src).expect("compile network request sidecar WAT to WASM")
+    }
+
     fn make_socket_sidecar_test_wasm(ip: [u8; 4], port: u16) -> Vec<u8> {
         let address = [
             0u8,
@@ -4023,6 +3885,77 @@ mod tests {
              )"
         );
         wat::parse_str(&wat_src).expect("compile socket sidecar WAT to WASM")
+    }
+
+    #[test]
+    fn sidecar_network_requests_roundtrip_through_host_executor() {
+        let engine = make_wasm_engine().expect("build test engine");
+        let request = host_request::HostRequest::HttpsGet {
+            host: "air-quality-api.open-meteo.com".to_string(),
+            path: "/v1/air-quality?latitude=-37.2452&longitude=144.4614&current=european_aqi"
+                .to_string(),
+            headers: Vec::new(),
+        };
+        let request_bytes = host_request::encode_request(&request).expect("encode request");
+        let wasm = make_network_request_sidecar_test_wasm(&request_bytes);
+        let module = Module::new(&engine, &wasm).expect("compile sidecar module");
+        let channel: SlideChannel = Arc::new(SlideMailbox::new());
+        let expected_response = host_request::encode_response(&host_request::HostResponse::Http {
+            status_code: 200,
+            headers: vec![host_request::Header {
+                name: "etag".to_string(),
+                value: "\"air-quality\"".to_string(),
+            }],
+            body: br#"{"current":{"european_aqi":42}}"#.to_vec(),
+        })
+        .expect("encode response");
+        let expected_response_clone = expected_response.clone();
+        let expected_request = request.clone();
+        let request_executor: SidecarRequestExecutor = Arc::new(move |bytes| {
+            let decoded = host_request::decode_request(bytes).map_err(|error| error.to_string())?;
+            assert_eq!(decoded, expected_request);
+            Ok(expected_response_clone.clone())
+        });
+
+        run_sidecar_module(
+            &engine,
+            &module,
+            Arc::clone(&channel),
+            &[],
+            "air-quality-sidecar-test",
+            request_executor,
+        )
+        .expect("run sidecar");
+
+        let state = channel
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.latest.as_deref(), Some(expected_response.as_slice()));
+        assert!(state.dirty);
+    }
+
+    #[test]
+    fn legacy_socket_sidecars_are_rejected() {
+        let engine = make_wasm_engine().expect("build test engine");
+        let wasm = make_socket_sidecar_test_wasm([127, 0, 0, 1], 443);
+        let module = Module::new(&engine, &wasm).expect("compile legacy sidecar module");
+        let channel: SlideChannel = Arc::new(SlideMailbox::new());
+
+        let error = run_sidecar_module(
+            &engine,
+            &module,
+            channel,
+            &[],
+            "legacy-sidecar-test",
+            default_sidecar_request_executor(),
+        )
+        .expect_err("legacy socket imports should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("sock_open") || message.contains("unknown import"),
+            "unexpected error: {message}"
+        );
     }
 
     /// A WASM that exports vzglyd_abi_version = 99 must produce AbiVersion error.
