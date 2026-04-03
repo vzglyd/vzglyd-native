@@ -185,13 +185,13 @@ fn print_help() {
     println!("  vzglyd pack <slide-dir> -o <archive.vzglyd> [--verbose]");
     println!();
     println!("Options:");
-    println!("  -d, --slides-dir <DIR>  Directory containing slide packages");
+    println!("  -d, --slides-dir <DIR>  Shared slides repo root (expects playlist.json)");
     println!("      --scene <PATH>      Run a single slide package directly");
     println!("  -v, --verbose           Enable verbose logging");
     println!("  -h, --help              Print this help message");
     println!();
     println!(
-        "When no slide source is provided, the host discovers slides from '{}'.",
+        "When no slide source is provided, the host looks for a shared slides repo at '{}'.",
         DEFAULT_SLIDES_DIR
     );
 }

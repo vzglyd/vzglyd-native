@@ -22,29 +22,32 @@ cargo build --release
 # Run without slides (shows colored background)
 cargo run
 
-# Run with a slides directory
+# Run with a shared slides repo
 cargo run -- --slides-dir slides/
 
 # Run with verbose output
 cargo run -- --slides-dir slides/ -v
 ```
 
-## Slides Folder
+## Shared Slides Repo
 
-The `slides/` folder contains WebAssembly slide files that are loaded at runtime.
-Each slide should be a `.wasm` file compiled for the VZGLYD ABI.
+The native host now expects `--slides-dir` to point at a shared slide repository root.
+That repo must contain a required `playlist.json`, and each playlist entry path must be
+repo-root-relative and point to a `.vzglyd` bundle.
 
-### Folder Structure
+### Repo Layout
 
 ```
 slides/
-├── courtyard/
-│   └── slide.wasm      # Courtyard visualization slide
-└── beach_dog/
-    └── slide.wasm      # Beach dog visualization slide
+├── playlist.json
+├── clock.vzglyd
+├── weather.vzglyd
+└── daily/
+    └── headlines.vzglyd
 ```
 
-Slides are discovered recursively in subdirectories.
+Missing or invalid `playlist.json` is treated as a startup error. Use `--scene <PATH>`
+when you want to run one bundle directly without the shared repo contract.
 
 ## Architecture
 

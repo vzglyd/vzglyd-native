@@ -2,11 +2,12 @@
 //!
 //! Integrates the kernel with winit event loop and wgpu rendering.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 use vzglyd_kernel::TransitionKind as KernelTransitionKind;
-use vzglyd_kernel::schedule::parse_playlist;
+use vzglyd_kernel::schedule::{PLAYLIST_FILENAME, Playlist, parse_playlist};
 use vzglyd_kernel::{
     Engine, EngineConfig, EngineInput, FrameRenderState, Host, LogLevel, RenderCommand, SlideEntry,
     SlideManifestMetadata,
@@ -164,7 +165,7 @@ impl NativeApp {
         if let Some(mut engine) = app.engine.take() {
             let mut host = HostWrapper { app: &mut app };
             engine.init(&mut host);
-            app.slides = load_schedule(&mut engine, &app.run_config);
+            app.slides = load_schedule(&mut engine, &app.run_config)?;
             app.engine = Some(engine);
         }
 
@@ -648,83 +649,78 @@ fn schedule_snapshot(engine: &Engine) -> Vec<ScheduledSlide> {
 }
 
 /// Builds the kernel schedule and returns the ordered slide metadata.
-fn load_schedule(engine: &mut Engine, run_config: &RunConfig) -> Vec<ScheduledSlide> {
+fn load_schedule(engine: &mut Engine, run_config: &RunConfig) -> Result<Vec<ScheduledSlide>, String> {
     if let Some(scene_path) = run_config.scene_path.as_ref() {
         eprintln!("[vzglyd] single-scene mode: {scene_path}");
         engine.set_schedule(vec![scene_path.clone()]);
-        return schedule_snapshot(engine);
+        return Ok(schedule_snapshot(engine));
     }
 
     let Some(slides_dir) = run_config.slides_dir.as_deref() else {
         eprintln!("[vzglyd] no slide source configured");
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
-    let playlist_path = std::path::Path::new(slides_dir).join("playlist.json");
+    let playlist_path = Path::new(slides_dir).join(PLAYLIST_FILENAME);
     eprintln!(
-        "[vzglyd] looking for playlist: {} (exists={})",
-        playlist_path.display(),
-        playlist_path.exists()
+        "[vzglyd] using shared slides repo root: {}",
+        slides_dir
     );
 
-    if playlist_path.exists() {
-        match std::fs::read(&playlist_path) {
-            Ok(bytes) => match parse_playlist(&bytes) {
-                Ok(playlist) => {
-                    engine.set_schedule_from_playlist(&playlist, slides_dir);
-                    let slides = schedule_snapshot(engine);
-                    let paths: Vec<&str> = slides.iter().map(|slide| slide.path.as_str()).collect();
-                    eprintln!(
-                        "[vzglyd] playlist.json: {} total entries, {} enabled → {:?}",
-                        playlist.slides.len(),
-                        slides.len(),
-                        paths
-                    );
-                    return slides;
-                }
-                Err(e) => eprintln!(
-                    "[vzglyd] WARNING: playlist.json parse failed: {} — falling back to discovery",
-                    e
-                ),
-            },
-            Err(e) => eprintln!(
-                "[vzglyd] WARNING: playlist.json read failed: {} — falling back to discovery",
-                e
-            ),
-        }
-    } else {
-        eprintln!(
-            "[vzglyd] no playlist.json — scanning '{}' for .vzglyd archives",
-            slides_dir
-        );
+    if !playlist_path.exists() {
+        return Err(format!(
+            "shared slides repo '{}' is missing required {}",
+            slides_dir,
+            PLAYLIST_FILENAME
+        ));
     }
 
-    let paths = discover_slide_paths(slides_dir);
-    eprintln!("[vzglyd] discovered: {:?}", paths);
-    engine.set_schedule(paths.clone());
-    schedule_snapshot(engine)
+    let bytes = std::fs::read(&playlist_path)
+        .map_err(|error| format!("failed to read {}: {}", playlist_path.display(), error))?;
+    let playlist = parse_playlist(&bytes)
+        .map_err(|error| format!("invalid {}: {}", playlist_path.display(), error))?;
+    validate_shared_repo_playlist(&playlist)
+        .map_err(|error| format!("invalid {}: {}", playlist_path.display(), error))?;
+
+    engine.set_schedule_from_playlist(&playlist, slides_dir);
+    let slides = schedule_snapshot(engine);
+    let paths: Vec<&str> = slides.iter().map(|slide| slide.path.as_str()).collect();
+    eprintln!(
+        "[vzglyd] {}: {} total entries, {} enabled → {:?}",
+        PLAYLIST_FILENAME,
+        playlist.slides.len(),
+        slides.len(),
+        paths
+    );
+
+    Ok(slides)
 }
 
-/// Scans `dir` (non-recursively) for `.vzglyd` archives and slide directories.
-fn discover_slide_paths(dir: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return paths;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if is_slide_archive(&path) {
-            if let Some(s) = path.to_str() {
-                paths.push(s.to_string());
-            }
-        } else if is_slide_directory(&path) {
-            if let Some(s) = path.to_str() {
-                paths.push(s.to_string());
-            }
-        }
+fn validate_shared_repo_playlist(playlist: &Playlist) -> Result<(), String> {
+    for (index, entry) in playlist.slides.iter().enumerate() {
+        validate_shared_repo_bundle_path(&entry.path)
+            .map_err(|error| format!("slides[{index}].path {}", error))?;
     }
-    paths.sort();
-    paths
+    Ok(())
+}
+
+fn validate_shared_repo_bundle_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("must be a non-empty string".into());
+    }
+    if path.starts_with('/') {
+        return Err("must be relative to the repo root".into());
+    }
+    if path.contains('\\') {
+        return Err("must use forward slashes".into());
+    }
+    if path.split('/').any(|segment| segment == "." || segment == "..") {
+        return Err("must not contain '.' or '..' path segments".into());
+    }
+    if !path.ends_with(".vzglyd") {
+        return Err("must point to a .vzglyd bundle".into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +778,31 @@ fn build_window_attributes(event_loop: &ActiveEventLoop, title: &str) -> WindowA
     attributes.with_window_level(level)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_repo_relative_bundle_paths() {
+        assert!(validate_shared_repo_bundle_path("clock.vzglyd").is_ok());
+        assert!(validate_shared_repo_bundle_path("daily/headlines.vzglyd").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_bundle_paths() {
+        let error = validate_shared_repo_bundle_path("daily/headlines/slide.wasm")
+            .expect_err("expected validation error");
+        assert!(error.contains(".vzglyd"));
+    }
+
+    #[test]
+    fn rejects_escape_segments() {
+        let error = validate_shared_repo_bundle_path("../clock.vzglyd")
+            .expect_err("expected validation error");
+        assert!(error.contains("'.' or '..'"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn x11_borderless_managed_geometry(
     event_loop: &ActiveEventLoop,
@@ -806,41 +827,6 @@ fn x11_borderless_managed_geometry(
     );
 
     Some((window_size, position))
-}
-
-fn is_slide_archive(path: &std::path::Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("vzglyd"))
-}
-
-fn is_slide_directory(path: &std::path::Path) -> bool {
-    if !path.is_dir() {
-        return false;
-    }
-
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-
-    let mut has_manifest = false;
-    let mut has_wasm = false;
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        if file_name == "manifest.json" || file_name.ends_with("_slide.json") {
-            has_manifest = true;
-        }
-        if file_name == "slide.wasm" || file_name.ends_with("_slide.wasm") {
-            has_wasm = true;
-        }
-    }
-
-    has_manifest && has_wasm
 }
 
 fn kernel_to_native_transition(kind: KernelTransitionKind) -> TransitionKind {

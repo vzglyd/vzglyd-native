@@ -624,7 +624,7 @@ fn load_sidecar(
     wasm_bytes: &[u8],
     tx: SlideChannel,
 ) -> Result<SidecarHandle, LoadError> {
-    load_sidecar_with_config(engine, wasm_bytes, tx, &[], "test-sidecar")
+    load_sidecar_with_config(engine, wasm_bytes, tx, &[], "test-sidecar", None)
 }
 
 fn load_sidecar_with_config(
@@ -633,6 +633,7 @@ fn load_sidecar_with_config(
     tx: SlideChannel,
     wasi_preopens: &[String],
     runtime_label: &str,
+    params_bytes: Option<&[u8]>,
 ) -> Result<SidecarHandle, LoadError> {
     load_sidecar_with_executor(
         engine,
@@ -640,6 +641,7 @@ fn load_sidecar_with_config(
         tx,
         wasi_preopens,
         runtime_label,
+        params_bytes,
         default_sidecar_request_executor(),
     )
 }
@@ -650,6 +652,7 @@ fn load_sidecar_with_executor(
     tx: SlideChannel,
     wasi_preopens: &[String],
     runtime_label: &str,
+    params_bytes: Option<&[u8]>,
     request_executor: SidecarRequestExecutor,
 ) -> Result<SidecarHandle, LoadError> {
     let module =
@@ -657,6 +660,7 @@ fn load_sidecar_with_executor(
     let engine = engine.clone();
     let wasi_preopens = wasi_preopens.to_vec();
     let runtime_label = runtime_label.to_string();
+    let params_bytes = params_bytes.map(|bytes| bytes.to_vec());
     log::info!(
         "sidecar:{} spawning (preopens={})",
         runtime_label,
@@ -672,6 +676,7 @@ fn load_sidecar_with_executor(
                 tx,
                 &wasi_preopens,
                 &runtime_label,
+                params_bytes.as_deref(),
                 request_executor,
             );
             #[cfg(test)]
@@ -696,6 +701,7 @@ fn run_sidecar_module(
     tx: SlideChannel,
     wasi_preopens: &[String],
     runtime_label: &str,
+    params_bytes: Option<&[u8]>,
     request_executor: SidecarRequestExecutor,
 ) -> Result<(), LoadError> {
     let mut wasi_builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
@@ -822,6 +828,42 @@ fn run_sidecar_module(
         .instantiate(&mut store, module)
         .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
     log::info!("sidecar:{} instantiated", store.data().label);
+
+    if let Some(params) = params_bytes {
+        let ptr_fn = instance
+            .get_typed_func::<(), i32>(&mut store, "vzglyd_params_ptr")
+            .ok();
+        let cap_fn = instance
+            .get_typed_func::<(), u32>(&mut store, "vzglyd_params_capacity")
+            .ok();
+        let cfg_fn = instance
+            .get_typed_func::<i32, i32>(&mut store, "vzglyd_configure")
+            .ok();
+        if let (Some(ptr_fn), Some(cap_fn), Some(cfg_fn)) = (ptr_fn, cap_fn, cfg_fn) {
+            let capacity = cap_fn
+                .call(&mut store, ())
+                .map_err(|error| LoadError::WasmLoad(error.to_string()))?
+                as usize;
+            let ptr = ptr_fn
+                .call(&mut store, ())
+                .map_err(|error| LoadError::WasmLoad(error.to_string()))?
+                as usize;
+            let write_len = params.len().min(capacity);
+            let memory = instance
+                .get_memory(&mut store, "memory")
+                .ok_or(LoadError::MissingExport("memory"))?;
+            memory
+                .write(&mut store, ptr, &params[..write_len])
+                .map_err(|error| LoadError::WasmLoad(format!("write params failed: {error}")))?;
+            let status = cfg_fn.call(&mut store, write_len as i32).map_err(|error| {
+                LoadError::WasmLoad(format!("vzglyd_configure failed: {error}"))
+            })?;
+            log::info!(
+                "sidecar:{} vzglyd_configure({write_len}) -> {status}",
+                store.data().label
+            );
+        }
+    }
 
     if let Ok(run_fn) = instance.get_typed_func::<(), i32>(&mut store, "vzglyd_sidecar_run") {
         log::info!("sidecar:{} invoking vzglyd_sidecar_run", store.data().label);
@@ -2045,6 +2087,7 @@ where
             channel,
             &sidecar_preopens,
             &sidecar_runtime_label,
+            params_bytes,
         )?;
         if let Some(runtime) = loaded.runtime.as_mut() {
             runtime.attach_sidecar(sidecar);
@@ -3887,6 +3930,61 @@ mod tests {
         wat::parse_str(&wat_src).expect("compile socket sidecar WAT to WASM")
     }
 
+    fn make_configurable_sidecar_test_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                 (import "vzglyd_host" "channel_push" (func $channel_push (param i32 i32) (result i32)))
+                 (memory (export "memory") 1)
+                 (func (export "vzglyd_params_ptr") (result i32) i32.const 32)
+                 (func (export "vzglyd_params_capacity") (result i32) i32.const 64)
+                 (func (export "vzglyd_configure") (param $len i32) (result i32)
+                   i32.const 0
+                   local.get $len
+                   i32.store
+                   i32.const 4
+                   i32.const 32
+                   i32.load8_u
+                   i32.store8
+                   i32.const 0)
+                 (func (export "vzglyd_sidecar_run") (result i32)
+                   i32.const 0
+                   i32.const 5
+                   call $channel_push
+                   drop
+                   i32.const 0))
+            "#,
+        )
+        .expect("compile configurable sidecar WAT to WASM")
+    }
+
+    #[test]
+    fn sidecar_configure_receives_playlist_params() {
+        let engine = make_wasm_engine().expect("build test engine");
+        let wasm = make_configurable_sidecar_test_wasm();
+        let module = Module::new(&engine, &wasm).expect("compile configurable sidecar module");
+        let channel: SlideChannel = Arc::new(SlideMailbox::new());
+        let params = br#"{"location":"Daylesford, VIC"}"#;
+
+        run_sidecar_module(
+            &engine,
+            &module,
+            Arc::clone(&channel),
+            &[],
+            "configurable-sidecar-test",
+            Some(params),
+            default_sidecar_request_executor(),
+        )
+        .expect("run configurable sidecar");
+
+        let state = channel
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let latest = state.latest.as_deref().expect("channel payload");
+        assert_eq!(&latest[..4], &(params.len() as u32).to_le_bytes());
+        assert_eq!(latest[4], b'{');
+    }
+
     #[test]
     fn sidecar_network_requests_roundtrip_through_host_executor() {
         let engine = make_wasm_engine().expect("build test engine");
@@ -3923,6 +4021,7 @@ mod tests {
             Arc::clone(&channel),
             &[],
             "air-quality-sidecar-test",
+            None,
             request_executor,
         )
         .expect("run sidecar");
@@ -3948,6 +4047,7 @@ mod tests {
             channel,
             &[],
             "legacy-sidecar-test",
+            None,
             default_sidecar_request_executor(),
         )
         .expect_err("legacy socket imports should fail");
