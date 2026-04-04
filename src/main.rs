@@ -37,8 +37,10 @@ fn main() -> ExitCode {
             source_dir,
             output_path,
             ..
-        } => match slide_loader::pack_slide_directory(Path::new(&source_dir), Path::new(&output_path))
-        {
+        } => match slide_loader::pack_slide_directory(
+            Path::new(&source_dir),
+            Path::new(&output_path),
+        ) {
             Ok(report) => {
                 eprintln!(
                     "[vzglyd] packed {} -> {} ({:.1}% overhead)",
@@ -119,6 +121,7 @@ fn parse_pack_command(args: &[String]) -> Result<Command, String> {
 fn parse_run_command(args: &[String]) -> Result<RunConfig, String> {
     let mut slides_dir = Some(DEFAULT_SLIDES_DIR.to_string());
     let mut scene_path = None;
+    let mut trace_session = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -142,6 +145,13 @@ fn parse_run_command(args: &[String]) -> Result<RunConfig, String> {
                 slides_dir = None;
                 i += 2;
             }
+            "--trace-session" => {
+                let Some(path) = args.get(i + 1) else {
+                    return Err("missing path after --trace-session".into());
+                };
+                trace_session = Some(path.clone());
+                i += 2;
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -155,6 +165,7 @@ fn parse_run_command(args: &[String]) -> Result<RunConfig, String> {
     Ok(RunConfig {
         slides_dir,
         scene_path,
+        trace_session,
     })
 }
 
@@ -187,6 +198,7 @@ fn print_help() {
     println!("Options:");
     println!("  -d, --slides-dir <DIR>  Shared slides repo root (expects playlist.json)");
     println!("      --scene <PATH>      Run a single slide package directly");
+    println!("      --trace-session <DIR>  Write Perfetto trace output into DIR");
     println!("  -v, --verbose           Enable verbose logging");
     println!("  -h, --help              Print this help message");
     println!();

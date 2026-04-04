@@ -62,10 +62,10 @@ dependencies = [
 [[package]]
 name = "VRX-64-slide"
 version = "0.1.0"
-source = "git+https://github.com/vzglyd/VRX-64-slide#988b9fe212f0422f5bc117225494a1b99c3eecc8"
 dependencies = [
  "bytemuck",
  "serde",
+ "serde_json",
  "wgpu",
 ]
 

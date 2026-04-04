@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use vzglyd_kernel::glb::{self, GlbError};
+use vzglyd_kernel::trace::TraceRecorder;
 use vzglyd_kernel::{
     ImportedCameraProjection, ImportedMesh, ImportedScene, ImportedSceneCamera,
     ImportedSceneDirectionalLight, ImportedSceneMeshNode, ImportedVertex,
@@ -30,6 +31,9 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::slide_manifest::{AssetRef, SlideManifest};
+use crate::trace::{
+    active_trace_recorder, parse_guest_trace_end_payload, parse_guest_trace_payload,
+};
 
 pub const ABI_VERSION: u32 = vzglyd_slide::ABI_VERSION;
 pub(crate) const SLIDE_UPDATE_NO_CHANGE: i32 = 0;
@@ -108,6 +112,8 @@ struct SlideStore {
     label: String,
     mesh_assets: HostMeshAssetCatalog,
     scene_metadata: HostSceneMetadataCatalog,
+    trace_recorder: Option<TraceRecorder>,
+    trace_thread: String,
 }
 
 struct SidecarStore {
@@ -116,6 +122,8 @@ struct SidecarStore {
     label: String,
     last_network_response: Vec<u8>,
     request_executor: SidecarRequestExecutor,
+    trace_recorder: Option<TraceRecorder>,
+    trace_thread: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,6 +325,14 @@ impl SlideRuntime {
 
     fn attach_sidecar(&mut self, sidecar: SidecarHandle) {
         log::info!("slide:{} attached sidecar thread", self.store.data().label);
+        if let Some(recorder) = self.store.data().trace_recorder.clone() {
+            recorder.instant(
+                self.store.data().trace_thread.clone(),
+                "lifecycle",
+                "attach_sidecar",
+                BTreeMap::new(),
+            );
+        }
         self.sidecar = Some(sidecar);
     }
 
@@ -325,6 +341,14 @@ impl SlideRuntime {
         if was_active != active {
             log::info!("slide:{} active={active}", self.store.data().label);
             self.store.data().rx.set_active(active);
+            if let Some(recorder) = self.store.data().trace_recorder.clone() {
+                recorder.instant(
+                    self.store.data().trace_thread.clone(),
+                    "lifecycle",
+                    "set_active",
+                    BTreeMap::from([("active".to_string(), active.to_string())]),
+                );
+            }
         }
     }
 
@@ -332,10 +356,26 @@ impl SlideRuntime {
         let Some(update_fn) = self.update_fn.as_ref() else {
             return Ok(SLIDE_UPDATE_NO_CHANGE);
         };
+        let mut trace = self.store.data().trace_recorder.clone().map(|recorder| {
+            let mut span = recorder.scoped(
+                self.store.data().trace_thread.clone(),
+                "runtime",
+                "vzglyd_update",
+            );
+            span.add_attr("dt_ms", format!("{:.3}", dt * 1000.0));
+            span
+        });
 
-        update_fn
+        let result = update_fn
             .call(&mut self.store, dt)
-            .map_err(|error| LoadError::WasmLoad(error.to_string()))
+            .map_err(|error| LoadError::WasmLoad(error.to_string()));
+        if let Some(trace) = trace.as_mut() {
+            match &result {
+                Ok(code) => trace.add_attr("status_code", code.to_string()),
+                Err(error) => trace.add_attr("error", error.to_string()),
+            }
+        }
+        result
     }
 
     pub(crate) fn has_overlay(&self) -> bool {
@@ -363,6 +403,13 @@ impl SlideRuntime {
         else {
             return Ok(None);
         };
+        let _trace = self.store.data().trace_recorder.clone().map(|recorder| {
+            recorder.scoped(
+                self.store.data().trace_thread.clone(),
+                "runtime",
+                "read_overlay",
+            )
+        });
 
         read_overlay_from_store(&mut self.store, &self.memory, overlay_ptr, overlay_len)
     }
@@ -377,6 +424,13 @@ impl SlideRuntime {
         ) else {
             return Ok(None);
         };
+        let _trace = self.store.data().trace_recorder.clone().map(|recorder| {
+            recorder.scoped(
+                self.store.data().trace_thread.clone(),
+                "runtime",
+                "read_dynamic_meshes",
+            )
+        });
 
         read_dynamic_meshes_from_store(&mut self.store, &self.memory, meshes_ptr, meshes_len)
     }
@@ -454,6 +508,40 @@ impl HostAssetAccess for SlideStore {
 
     fn scene_metadata(&self) -> &HostSceneMetadataCatalog {
         &self.scene_metadata
+    }
+}
+
+trait HostTraceAccess {
+    fn trace_recorder(&self) -> Option<TraceRecorder>;
+    fn trace_thread(&self) -> &str;
+    fn trace_category(&self) -> &'static str;
+}
+
+impl HostTraceAccess for SlideStore {
+    fn trace_recorder(&self) -> Option<TraceRecorder> {
+        self.trace_recorder.clone()
+    }
+
+    fn trace_thread(&self) -> &str {
+        &self.trace_thread
+    }
+
+    fn trace_category(&self) -> &'static str {
+        "guest.slide"
+    }
+}
+
+impl HostTraceAccess for SidecarStore {
+    fn trace_recorder(&self) -> Option<TraceRecorder> {
+        self.trace_recorder.clone()
+    }
+
+    fn trace_thread(&self) -> &str {
+        &self.trace_thread
+    }
+
+    fn trace_category(&self) -> &'static str {
+        "guest.sidecar"
     }
 }
 
@@ -539,6 +627,14 @@ fn host_channel_poll(
             msg.len(),
             preview_bytes(msg, 160)
         );
+        if let Some(recorder) = caller.data().trace_recorder.clone() {
+            recorder.instant(
+                caller.data().trace_thread.clone(),
+                "channel",
+                "channel_poll",
+                BTreeMap::from([("bytes".to_string(), msg.len().to_string())]),
+            );
+        }
         msg.len() as i32
     };
     state.dirty = false;
@@ -549,6 +645,14 @@ fn host_slide_log_info(caller: &mut wasmtime::Caller<'_, SlideStore>, ptr: i32, 
     match read_host_string(caller, ptr, len) {
         Ok(message) => {
             log::info!("slide:{} {message}", caller.data().label);
+            if let Some(recorder) = caller.data().trace_recorder.clone() {
+                recorder.instant(
+                    caller.data().trace_thread.clone(),
+                    "guest.log",
+                    "slide_log",
+                    BTreeMap::from([("message".to_string(), message.clone())]),
+                );
+            }
             0
         }
         Err(status) => status,
@@ -563,10 +667,82 @@ fn host_sidecar_log_info(
     match read_host_string(caller, ptr, len) {
         Ok(message) => {
             log::info!("sidecar:{} {message}", caller.data().label);
+            if let Some(recorder) = caller.data().trace_recorder.clone() {
+                recorder.instant(
+                    caller.data().trace_thread.clone(),
+                    "guest.log",
+                    "sidecar_log",
+                    BTreeMap::from([("message".to_string(), message.clone())]),
+                );
+            }
             0
         }
         Err(status) => status,
     }
+}
+
+fn host_trace_span_start<T: HostTraceAccess>(
+    caller: &mut wasmtime::Caller<'_, T>,
+    ptr: i32,
+    len: i32,
+) -> i32 {
+    let Ok(message) = read_host_string(caller, ptr, len) else {
+        return HOST_ERROR;
+    };
+    let Some(payload) = parse_guest_trace_payload(&message) else {
+        return HOST_ERROR;
+    };
+    let Some(recorder) = caller.data().trace_recorder() else {
+        return 0;
+    };
+    recorder.guest_span_start(
+        caller.data().trace_thread().to_string(),
+        caller.data().trace_category(),
+        payload.name,
+        payload.attrs,
+    )
+}
+
+fn host_trace_span_end<T: HostTraceAccess>(
+    caller: &mut wasmtime::Caller<'_, T>,
+    span_id: i32,
+    ptr: i32,
+    len: i32,
+) -> i32 {
+    let payload = if len > 0 {
+        match read_host_string(caller, ptr, len) {
+            Ok(message) => parse_guest_trace_end_payload(&message),
+            Err(_) => return HOST_ERROR,
+        }
+    } else {
+        crate::trace::GuestTraceEndPayload::default()
+    };
+    if let Some(recorder) = caller.data().trace_recorder() {
+        recorder.guest_span_end(span_id, payload.status, payload.attrs);
+    }
+    0
+}
+
+fn host_trace_event<T: HostTraceAccess>(
+    caller: &mut wasmtime::Caller<'_, T>,
+    ptr: i32,
+    len: i32,
+) -> i32 {
+    let Ok(message) = read_host_string(caller, ptr, len) else {
+        return HOST_ERROR;
+    };
+    let Some(payload) = parse_guest_trace_payload(&message) else {
+        return HOST_ERROR;
+    };
+    if let Some(recorder) = caller.data().trace_recorder() {
+        recorder.instant(
+            caller.data().trace_thread().to_string(),
+            caller.data().trace_category(),
+            payload.name,
+            payload.attrs,
+        );
+    }
+    0
 }
 
 fn caller_memory<T>(caller: &mut wasmtime::Caller<'_, T>) -> Result<Memory, i32> {
@@ -719,6 +895,8 @@ fn run_sidecar_module(
             label: runtime_label.to_string(),
             last_network_response: Vec::new(),
             request_executor,
+            trace_recorder: active_trace_recorder(),
+            trace_thread: format!("sidecar:{runtime_label}"),
         },
     );
     configure_runtime_store(&mut store);
@@ -742,6 +920,14 @@ fn run_sidecar_module(
                     bytes.len(),
                     preview_bytes(&bytes, 160)
                 );
+                if let Some(recorder) = caller.data().trace_recorder.clone() {
+                    recorder.instant(
+                        caller.data().trace_thread.clone(),
+                        "channel",
+                        "channel_push",
+                        BTreeMap::from([("bytes".to_string(), bytes.len().to_string())]),
+                    );
+                }
                 tx.push_latest(bytes);
                 WASI_ERRNO_SUCCESS
             },
@@ -768,6 +954,35 @@ fn run_sidecar_module(
     linker
         .func_wrap(
             "vzglyd_host",
+            "trace_span_start",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>, ptr: i32, len: i32| -> i32 {
+                host_trace_span_start(&mut caller, ptr, len)
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "trace_span_end",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>,
+             span_id: i32,
+             ptr: i32,
+             len: i32|
+             -> i32 { host_trace_span_end(&mut caller, span_id, ptr, len) },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "trace_event",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>, ptr: i32, len: i32| -> i32 {
+                host_trace_event(&mut caller, ptr, len)
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
             "channel_active",
             |caller: wasmtime::Caller<'_, SidecarStore>| -> i32 {
                 i32::from(caller.data().tx.is_active())
@@ -783,13 +998,31 @@ fn run_sidecar_module(
                     Ok(bytes) => bytes,
                     Err(_) => return HOST_ERROR,
                 };
+                let mut trace = caller.data().trace_recorder.clone().map(|recorder| {
+                    let mut span = recorder.scoped(
+                        caller.data().trace_thread.clone(),
+                        "host",
+                        "network_request",
+                    );
+                    span.add_attr("request_bytes", request_bytes.len().to_string());
+                    span
+                });
                 let response_bytes = match (caller.data().request_executor)(&request_bytes) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        log::warn!("sidecar:{} host request failed: {error}", caller.data().label);
+                        log::warn!(
+                            "sidecar:{} host request failed: {error}",
+                            caller.data().label
+                        );
+                        if let Some(trace) = trace.as_mut() {
+                            trace.add_attr("error", error.clone());
+                        }
                         return HOST_ERROR;
                     }
                 };
+                if let Some(trace) = trace.as_mut() {
+                    trace.add_attr("response_bytes", response_bytes.len().to_string());
+                }
                 caller.data_mut().last_network_response = response_bytes;
                 WASI_ERRNO_SUCCESS
             },
@@ -1267,9 +1500,10 @@ impl AssetLoader {
     ) -> Result<StaticMesh<V>, LoadError> {
         let resolved = self.resolve(path)?;
         let imported = glb::load_glb_mesh(&resolved).map_err(|e| match e {
-            GlbError::ReadError(_, msg) | GlbError::ParseError(_, msg) | GlbError::FormatError(msg) | GlbError::Unsupported(msg) => {
-                LoadError::AssetLoad(msg)
-            }
+            GlbError::ReadError(_, msg)
+            | GlbError::ParseError(_, msg)
+            | GlbError::FormatError(msg)
+            | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
         })?;
         let fallback = template.vertices.first();
         Ok(StaticMesh {
@@ -1313,7 +1547,7 @@ pub(crate) fn load_authored_scene_from_manifest(
 
     let loader = AssetLoader::new(package_root)?;
     let resolved = loader.resolve(&scene_asset.path)?;
-    
+
     let kernel_scene_asset = vzglyd_kernel::SceneAssetRef {
         path: scene_asset.path.clone(),
         id: scene_asset.id.clone(),
@@ -1321,13 +1555,14 @@ pub(crate) fn load_authored_scene_from_manifest(
         entry_camera: scene_asset.entry_camera.clone(),
         compile_profile: scene_asset.compile_profile.clone(),
     };
-    
+
     glb::load_glb_scene(&resolved, Some(&kernel_scene_asset))
         .map(Some)
         .map_err(|e| match e {
-            GlbError::ReadError(_, msg) | GlbError::ParseError(_, msg) | GlbError::FormatError(msg) | GlbError::Unsupported(msg) => {
-                LoadError::AssetLoad(msg)
-            }
+            GlbError::ReadError(_, msg)
+            | GlbError::ParseError(_, msg)
+            | GlbError::FormatError(msg)
+            | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
         })
 }
 
@@ -1868,9 +2103,10 @@ fn build_host_mesh_asset_catalog(
         let resolved = loader.resolve(&mesh.path)?;
         let runtime_key = mesh_runtime_key(mesh, &resolved);
         let imported = glb::load_glb_mesh(&resolved).map_err(|e| match e {
-            GlbError::ReadError(_, msg) | GlbError::ParseError(_, msg) | GlbError::FormatError(msg) | GlbError::Unsupported(msg) => {
-                LoadError::AssetLoad(msg)
-            }
+            GlbError::ReadError(_, msg)
+            | GlbError::ParseError(_, msg)
+            | GlbError::FormatError(msg)
+            | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
         })?;
         let encoded = encode_mesh_asset(&imported)?;
         if encoded_by_key
@@ -1909,11 +2145,13 @@ fn build_host_scene_metadata_catalog(
             entry_camera: scene_ref.entry_camera.clone(),
             compile_profile: scene_ref.compile_profile.clone(),
         };
-        let imported = glb::load_glb_scene(&resolved, Some(&kernel_scene_ref)).map_err(|e| match e {
-            GlbError::ReadError(_, msg) | GlbError::ParseError(_, msg) | GlbError::FormatError(msg) | GlbError::Unsupported(msg) => {
-                LoadError::AssetLoad(msg)
-            }
-        })?;
+        let imported =
+            glb::load_glb_scene(&resolved, Some(&kernel_scene_ref)).map_err(|e| match e {
+                GlbError::ReadError(_, msg)
+                | GlbError::ParseError(_, msg)
+                | GlbError::FormatError(msg)
+                | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
+            })?;
         let runtime_key = imported.id.clone();
         let encoded = encode_scene_metadata(&imported)?;
         if encoded_by_key
@@ -2508,9 +2746,8 @@ pub fn extract_embedded_bytes_to_cache(bytes: &[u8]) -> Result<PathBuf, LoadErro
     })?;
 
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = ZipArchive::new(cursor).map_err(|error| {
-        LoadError::Archive(format!("embedded loading slide corrupt: {error}"))
-    })?;
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|error| LoadError::Archive(format!("embedded loading slide corrupt: {error}")))?;
     let extract_result = extract_zip_entries(&mut archive, "embedded", &staging_root);
     if let Err(error) = extract_result {
         let _ = std::fs::remove_dir_all(&staging_root);
@@ -2879,6 +3116,8 @@ where
             label: runtime_label.to_string(),
             mesh_assets,
             scene_metadata,
+            trace_recorder: active_trace_recorder(),
+            trace_thread: format!("slide:{runtime_label}"),
         },
     );
     configure_runtime_store(&mut store);
@@ -2901,6 +3140,35 @@ where
             "log_info",
             |mut caller: wasmtime::Caller<'_, SlideStore>, ptr: i32, len: i32| -> i32 {
                 host_slide_log_info(&mut caller, ptr, len)
+            },
+        )
+        .map_err(|e| LoadError::WasmLoad(e.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "trace_span_start",
+            |mut caller: wasmtime::Caller<'_, SlideStore>, ptr: i32, len: i32| -> i32 {
+                host_trace_span_start(&mut caller, ptr, len)
+            },
+        )
+        .map_err(|e| LoadError::WasmLoad(e.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "trace_span_end",
+            |mut caller: wasmtime::Caller<'_, SlideStore>,
+             span_id: i32,
+             ptr: i32,
+             len: i32|
+             -> i32 { host_trace_span_end(&mut caller, span_id, ptr, len) },
+        )
+        .map_err(|e| LoadError::WasmLoad(e.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "trace_event",
+            |mut caller: wasmtime::Caller<'_, SlideStore>, ptr: i32, len: i32| -> i32 {
+                host_trace_event(&mut caller, ptr, len)
             },
         )
         .map_err(|e| LoadError::WasmLoad(e.to_string()))?;
@@ -3019,13 +3287,20 @@ where
 
     // Optional configure protocol: write JSON params before vzglyd_init.
     if let Some(params) = params_bytes {
-        let ptr_fn = instance.get_typed_func::<(), i32>(&mut *store, "vzglyd_params_ptr").ok();
-        let cap_fn = instance.get_typed_func::<(), u32>(&mut *store, "vzglyd_params_capacity").ok();
-        let cfg_fn = instance.get_typed_func::<i32, i32>(&mut *store, "vzglyd_configure").ok();
+        let ptr_fn = instance
+            .get_typed_func::<(), i32>(&mut *store, "vzglyd_params_ptr")
+            .ok();
+        let cap_fn = instance
+            .get_typed_func::<(), u32>(&mut *store, "vzglyd_params_capacity")
+            .ok();
+        let cfg_fn = instance
+            .get_typed_func::<i32, i32>(&mut *store, "vzglyd_configure")
+            .ok();
         if let (Some(ptr_fn), Some(cap_fn), Some(cfg_fn)) = (ptr_fn, cap_fn, cfg_fn) {
             let capacity = cap_fn
                 .call(&mut *store, ())
-                .map_err(|e| LoadError::WasmLoad(e.to_string()))? as usize;
+                .map_err(|e| LoadError::WasmLoad(e.to_string()))?
+                as usize;
             let ptr = ptr_fn
                 .call(&mut *store, ())
                 .map_err(|e| LoadError::WasmLoad(e.to_string()))? as usize;
@@ -3038,8 +3313,13 @@ where
                 .map_err(|e| LoadError::WasmLoad(format!("write params failed: {e}")))?;
             let status = cfg_fn
                 .call(&mut *store, write_len as i32)
-                .map_err(|error| LoadError::WasmLoad(format!("vzglyd_configure failed: {error}")))?;
-            log::info!("slide:{} vzglyd_configure({write_len}) -> {status}", store.data().label);
+                .map_err(|error| {
+                    LoadError::WasmLoad(format!("vzglyd_configure failed: {error}"))
+                })?;
+            log::info!(
+                "slide:{} vzglyd_configure({write_len}) -> {status}",
+                store.data().label
+            );
         }
     }
 
@@ -3091,14 +3371,14 @@ where
 mod tests {
     use super::*;
     use image::{ColorType, ImageFormat};
-    use vzglyd_slide::{
-        DrawSource, DrawSpec, Limits, PipelineKind, SceneAnchorSet, SceneSpace, SlideSpec,
-        SpecError, StaticMesh,
-    };
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use vzglyd_slide::{
+        DrawSource, DrawSpec, Limits, PipelineKind, SceneAnchorSet, SceneSpace, SlideSpec,
+        SpecError, StaticMesh,
+    };
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -3118,8 +3398,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
-        let path =
-            PathBuf::from("target").join(format!("vzglyd_{label}_{}_{}", std::process::id(), unique));
+        let path = PathBuf::from("target").join(format!(
+            "vzglyd_{label}_{}_{}",
+            std::process::id(),
+            unique
+        ));
         std::fs::create_dir_all(&path).expect("create relative package dir");
         path
     }
@@ -4238,11 +4521,8 @@ mod tests {
         let (mut dir_loaded, dir_manifest) =
             load_slide_from_wasm::<WorldVertex>(PATH, None).expect("load directory package");
         let (mut archive_loaded, archive_manifest) =
-            load_slide_from_archive::<WorldVertex>(
-                archive_path.to_string_lossy().as_ref(),
-                None,
-            )
-            .expect("load archive package");
+            load_slide_from_archive::<WorldVertex>(archive_path.to_string_lossy().as_ref(), None)
+                .expect("load archive package");
 
         assert_eq!(archive_manifest.name, dir_manifest.name);
         assert_eq!(
@@ -4588,13 +4868,12 @@ mod tests {
             &reference_scene_anchor_wasm(),
         );
 
-        let error = match load_slide_from_wasm::<WorldVertex>(
-            package_dir.to_string_lossy().as_ref(),
-            None,
-        ) {
-            Ok(_) => panic!("missing authored anchor should fail"),
-            Err(error) => error,
-        };
+        let error =
+            match load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
+            {
+                Ok(_) => panic!("missing authored anchor should fail"),
+                Err(error) => error,
+            };
         assert!(
             error.to_string().contains("vzglyd_init failed"),
             "unexpected error: {error}"
@@ -4921,11 +5200,9 @@ cp built/slide.wasm slide.wasm
         let (dir_loaded, _) =
             load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
                 .expect("load directory package");
-        let (archive_loaded, _) = load_slide_from_archive::<WorldVertex>(
-            archive_path.to_string_lossy().as_ref(),
-            None,
-        )
-        .expect("load archive package");
+        let (archive_loaded, _) =
+            load_slide_from_archive::<WorldVertex>(archive_path.to_string_lossy().as_ref(), None)
+                .expect("load archive package");
 
         assert_eq!(
             archive_loaded.spec.static_meshes[1].vertices[0].position,

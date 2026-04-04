@@ -27,6 +27,9 @@ cargo run -- --slides-dir slides/
 
 # Run with verbose output
 cargo run -- --slides-dir slides/ -v
+
+# Run a single bundle with tracing enabled
+cargo run -- --trace-session /tmp/trace/native --scene /path/to/slide.vzglyd
 ```
 
 ## Shared Slides Repo
@@ -48,6 +51,12 @@ slides/
 
 Missing or invalid `playlist.json` is treated as a startup error. Use `--scene <PATH>`
 when you want to run one bundle directly without the shared repo contract.
+
+## Tracing
+
+Use `--trace-session <DIR>` to write a Perfetto-compatible `trace.json` and `session.json`.
+
+For the full collection workflow, session bootstrap, browser collector, and comparison tooling, use the sibling repo `VRX-64-tracing`.
 
 ## Architecture
 

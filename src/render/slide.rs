@@ -16,6 +16,7 @@ use crate::render::shader_contract::{ShaderContract, assemble_slide_shader_sourc
 use crate::slide::{DecodedSlideSpec, decode_slide_spec};
 use crate::slide_loader::{self, LoadError};
 use crate::slide_manifest::SlideManifest;
+use crate::trace::active_trace_recorder;
 use crate::utils::clock::melbourne_clock_seconds;
 
 /// Uniforms for screen-space slides.
@@ -282,13 +283,15 @@ impl ScreenSlideRenderer {
                     vertex_buffer: Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("overlay_vertex_buffer"),
                         size: (spec.limits.max_vertices as usize
-                            * std::mem::size_of::<ScreenVertex>()) as u64,
+                            * std::mem::size_of::<ScreenVertex>())
+                            as u64,
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     })),
                     index_buffer: Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("overlay_index_buffer"),
-                        size: (spec.limits.max_indices as usize * std::mem::size_of::<u16>()) as u64,
+                        size: (spec.limits.max_indices as usize * std::mem::size_of::<u16>())
+                            as u64,
                         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     })),
@@ -300,7 +303,9 @@ impl ScreenSlideRenderer {
             })
         };
 
-        if let (Some(overlay_runtime), Some(static_overlay)) = (overlay.as_mut(), spec.overlay.as_ref()) {
+        if let (Some(overlay_runtime), Some(static_overlay)) =
+            (overlay.as_mut(), spec.overlay.as_ref())
+        {
             overlay_runtime.apply(ctx, static_overlay);
         }
 
@@ -343,6 +348,13 @@ impl ScreenSlideRenderer {
 
     /// Updates the slide and returns whether it changed.
     pub fn update(&mut self, ctx: &GpuContext, dt: f32) -> bool {
+        let _trace = active_trace_recorder().map(|recorder| {
+            recorder.scoped(
+                format!("native.render.screen:{}", self.spec.name),
+                "renderer",
+                "screen_update",
+            )
+        });
         self.elapsed += dt;
         if let Some(background_scene) = self.background_scene.as_mut() {
             background_scene.set_elapsed(self.elapsed);
@@ -354,6 +366,13 @@ impl ScreenSlideRenderer {
                     if let (Some(runtime), Some(overlay)) = (&mut self.runtime, &mut self.overlay) {
                         match runtime.read_overlay::<ScreenVertex>() {
                             Ok(Some(updated_overlay)) if overlay.validate(&updated_overlay) => {
+                                let _upload_trace = active_trace_recorder().map(|recorder| {
+                                    recorder.scoped(
+                                        format!("native.render.screen:{}", self.spec.name),
+                                        "renderer",
+                                        "overlay_upload",
+                                    )
+                                });
                                 overlay.apply(ctx, &updated_overlay);
                             }
                             Ok(Some(_)) => {
@@ -383,6 +402,13 @@ impl ScreenSlideRenderer {
 
     /// Renders the slide to an offscreen target.
     pub fn render(&self, ctx: &GpuContext, target: &OffscreenTarget) {
+        let _trace = active_trace_recorder().map(|recorder| {
+            recorder.scoped(
+                format!("native.render.screen:{}", self.spec.name),
+                "renderer",
+                "screen_render",
+            )
+        });
         if let Some(background_scene) = &self.background_scene {
             background_scene.render(ctx, target);
         }
@@ -618,6 +644,13 @@ impl WorldSlideRenderer {
 
     /// Updates the slide and returns whether it changed.
     pub fn update(&mut self, ctx: &GpuContext, dt: f32) -> bool {
+        let _trace = active_trace_recorder().map(|recorder| {
+            recorder.scoped(
+                format!("native.render.world:{}", self.spec.name),
+                "renderer",
+                "world_update",
+            )
+        });
         self.elapsed += dt;
         if let Some(runtime) = &mut self.runtime {
             match runtime.update(dt) {
@@ -625,6 +658,13 @@ impl WorldSlideRenderer {
                 Ok(code) if code == slide_loader::SLIDE_UPDATE_MESHES_UPDATED => {
                     match runtime.read_dynamic_meshes::<WorldVertex>() {
                         Ok(Some(meshes)) => {
+                            let _upload_trace = active_trace_recorder().map(|recorder| {
+                                recorder.scoped(
+                                    format!("native.render.world:{}", self.spec.name),
+                                    "renderer",
+                                    "dynamic_mesh_upload",
+                                )
+                            });
                             apply_runtime_world_meshes(ctx, &mut self.dynamic_meshes, &meshes);
                         }
                         Ok(None) => {}
@@ -648,6 +688,13 @@ impl WorldSlideRenderer {
 
     /// Renders the slide to an offscreen target.
     pub fn render(&self, ctx: &GpuContext, target: &OffscreenTarget) {
+        let _trace = active_trace_recorder().map(|recorder| {
+            recorder.scoped(
+                format!("native.render.world:{}", self.spec.name),
+                "renderer",
+                "world_render",
+            )
+        });
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -714,10 +761,8 @@ impl WorldSlideRenderer {
                                 let available = mesh
                                     .current_index_count
                                     .saturating_sub(draw.index_range.start);
-                                let requested = draw
-                                    .index_range
-                                    .end
-                                    .saturating_sub(draw.index_range.start);
+                                let requested =
+                                    draw.index_range.end.saturating_sub(draw.index_range.start);
                                 let count = available.min(requested);
                                 if count > 0 {
                                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -782,8 +827,14 @@ impl OverlayRuntime {
             return;
         }
 
-        let used_vertices = overlay.vertices.len().min(self.buffers.vertex_capacity as usize);
-        let used_indices = overlay.indices.len().min(self.buffers.index_capacity as usize);
+        let used_vertices = overlay
+            .vertices
+            .len()
+            .min(self.buffers.vertex_capacity as usize);
+        let used_indices = overlay
+            .indices
+            .len()
+            .min(self.buffers.index_capacity as usize);
         ctx.queue.write_buffer(
             &self.buffers.vertex_buffer,
             0,
@@ -1195,10 +1246,9 @@ fn resolve_slide_shader_source(
                 .or(sources.vertex_wgsl.as_deref())
         })
         .unwrap_or_else(|| match (contract, shader_source_hint) {
-            (
-                ShaderContract::World3D,
-                Some(slide_loader::ShaderSourceHint::DefaultWorldScene),
-            ) => include_str!("../imported_scene_shader.wgsl"),
+            (ShaderContract::World3D, Some(slide_loader::ShaderSourceHint::DefaultWorldScene)) => {
+                include_str!("../imported_scene_shader.wgsl")
+            }
             _ => default_shader_body,
         });
     assemble_slide_shader_source(contract, shader_body)
@@ -1570,9 +1620,9 @@ pub fn create_loaded_slide_renderer(
     slide: LoadedSlide,
 ) -> Result<SlideRenderer, String> {
     match slide {
-        LoadedSlide::World(world) => {
-            Ok(SlideRenderer::World(WorldSlideRenderer::from_loaded(ctx, world)?))
-        }
+        LoadedSlide::World(world) => Ok(SlideRenderer::World(WorldSlideRenderer::from_loaded(
+            ctx, world,
+        )?)),
         LoadedSlide::Screen(screen) => Ok(SlideRenderer::Screen(ScreenSlideRenderer::from_loaded(
             ctx, screen,
         )?)),

@@ -29,6 +29,7 @@ use crate::render::{
     load_wasm_slide, load_wasm_slide_from_bytes,
 };
 use crate::slide_manifest::SlideManifest;
+use crate::trace::set_active_trace_recorder;
 
 const LOADING_SCENE_PATH: &str = "$loading";
 const LOADING_SLIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/loading.vzglyd"));
@@ -39,6 +40,7 @@ const X11_BORDERLESS_INSET: u32 = 1;
 pub struct RunConfig {
     pub slides_dir: Option<String>,
     pub scene_path: Option<String>,
+    pub trace_session: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,7 @@ pub struct NativeApp {
 
     /// Receives compiled slides from the background loader thread.
     pending_rx: Option<Receiver<Result<PendingSlide, (usize, String, String)>>>,
+    trace_recorder: Option<vzglyd_kernel::trace::TraceRecorder>,
 }
 
 /// Loaded slide renderer with metadata and the optional extracted archive directory.
@@ -134,6 +137,29 @@ impl<'a> Host for HostWrapper<'a> {
 impl NativeApp {
     /// Creates a new native application.
     pub fn new(run_config: RunConfig) -> Result<Self, String> {
+        let trace_recorder = if let Some(trace_dir) = run_config.trace_session.as_deref() {
+            let recorder = vzglyd_kernel::trace::TraceRecorder::new(
+                trace_dir,
+                "native",
+                trace_label(&run_config),
+            )
+            .map_err(|error| format!("Failed to create trace recorder: {error}"))?;
+            if let Some(scene_path) = run_config.scene_path.as_deref() {
+                recorder.set_metadata("scene_path", scene_path);
+            }
+            if let Some(slides_dir) = run_config.slides_dir.as_deref() {
+                recorder.set_metadata("slides_dir", slides_dir);
+            }
+            log::info!(
+                "native tracing enabled: {}",
+                recorder.trace_path().display()
+            );
+            Some(recorder)
+        } else {
+            None
+        };
+        set_active_trace_recorder(trace_recorder.clone());
+
         Ok(Self {
             context: None,
             engine: Some(Engine::with_config(EngineConfig::default())),
@@ -150,6 +176,7 @@ impl NativeApp {
             offscreen_targets: Vec::new(),
             composite_target: None,
             pending_rx: None,
+            trace_recorder,
         })
     }
 
@@ -263,9 +290,7 @@ impl NativeApp {
     fn start_background_load(&mut self) {
         if self.slides.is_empty() {
             eprintln!("[vzglyd] no slides to load — window will stay blank");
-            log::warn!(
-                "No slides to load — check the configured slide source"
-            );
+            log::warn!("No slides to load — check the configured slide source");
             return;
         }
 
@@ -443,6 +468,10 @@ impl NativeApp {
 
     /// Renders the current frame, driven entirely by kernel `frame_state()`.
     fn render_frame(&mut self, dt: f32) {
+        let _frame_trace = self
+            .trace_recorder
+            .as_ref()
+            .map(|recorder| recorder.scoped("native.main", "frame", "render_frame"));
         if self.is_bootstrapping() {
             self.render_bootstrap(dt);
             return;
@@ -587,6 +616,15 @@ impl NativeApp {
     }
 }
 
+impl Drop for NativeApp {
+    fn drop(&mut self) {
+        if let Some(recorder) = self.trace_recorder.take() {
+            let _ = recorder.flush();
+        }
+        set_active_trace_recorder(None);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Background loading helpers
 // ---------------------------------------------------------------------------
@@ -623,6 +661,17 @@ fn load_slide_package(
     })
 }
 
+fn trace_label(run_config: &RunConfig) -> String {
+    let raw = run_config
+        .scene_path
+        .as_deref()
+        .or(run_config.slides_dir.as_deref())
+        .unwrap_or("native-session");
+    raw.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Schedule helpers
 // ---------------------------------------------------------------------------
@@ -649,7 +698,10 @@ fn schedule_snapshot(engine: &Engine) -> Vec<ScheduledSlide> {
 }
 
 /// Builds the kernel schedule and returns the ordered slide metadata.
-fn load_schedule(engine: &mut Engine, run_config: &RunConfig) -> Result<Vec<ScheduledSlide>, String> {
+fn load_schedule(
+    engine: &mut Engine,
+    run_config: &RunConfig,
+) -> Result<Vec<ScheduledSlide>, String> {
     if let Some(scene_path) = run_config.scene_path.as_ref() {
         eprintln!("[vzglyd] single-scene mode: {scene_path}");
         engine.set_schedule(vec![scene_path.clone()]);
@@ -662,16 +714,12 @@ fn load_schedule(engine: &mut Engine, run_config: &RunConfig) -> Result<Vec<Sche
     };
 
     let playlist_path = Path::new(slides_dir).join(PLAYLIST_FILENAME);
-    eprintln!(
-        "[vzglyd] using shared slides repo root: {}",
-        slides_dir
-    );
+    eprintln!("[vzglyd] using shared slides repo root: {}", slides_dir);
 
     if !playlist_path.exists() {
         return Err(format!(
             "shared slides repo '{}' is missing required {}",
-            slides_dir,
-            PLAYLIST_FILENAME
+            slides_dir, PLAYLIST_FILENAME
         ));
     }
 
@@ -714,7 +762,10 @@ fn validate_shared_repo_bundle_path(path: &str) -> Result<(), String> {
     if path.contains('\\') {
         return Err("must use forward slashes".into());
     }
-    if path.split('/').any(|segment| segment == "." || segment == "..") {
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
         return Err("must not contain '.' or '..' path segments".into());
     }
     if !path.ends_with(".vzglyd") {
