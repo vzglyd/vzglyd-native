@@ -2,8 +2,12 @@
 //!
 //! Integrates the kernel with winit event loop and wgpu rendering.
 
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use vzglyd_kernel::TransitionKind as KernelTransitionKind;
@@ -35,6 +39,8 @@ const LOADING_SCENE_PATH: &str = "$loading";
 const LOADING_SLIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/loading.vzglyd"));
 #[cfg(target_os = "linux")]
 const X11_BORDERLESS_INSET: u32 = 1;
+static SHUTDOWN_SIGNAL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+static SHUTDOWN_SIGNAL_HANDLERS: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct RunConfig {
@@ -87,6 +93,7 @@ pub struct NativeApp {
     /// Receives compiled slides from the background loader thread.
     pending_rx: Option<Receiver<Result<PendingSlide, (usize, String, String)>>>,
     trace_recorder: Option<vzglyd_kernel::trace::TraceRecorder>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 /// Loaded slide renderer with metadata and the optional extracted archive directory.
@@ -138,6 +145,7 @@ impl<'a> Host for HostWrapper<'a> {
 impl NativeApp {
     /// Creates a new native application.
     pub fn new(run_config: RunConfig) -> Result<Self, String> {
+        let shutdown_requested = install_shutdown_signal_handlers()?;
         let trace_recorder = if run_config.trace {
             let trace_path = resolve_trace_output_path(&run_config);
             let recorder = vzglyd_kernel::trace::TraceRecorder::new(
@@ -179,6 +187,7 @@ impl NativeApp {
             composite_target: None,
             pending_rx: None,
             trace_recorder,
+            shutdown_requested,
         })
     }
 
@@ -207,6 +216,25 @@ impl NativeApp {
 
     fn is_bootstrapping(&self) -> bool {
         self.bootstrap_renderer.is_some() && self.pending_rx.is_some()
+    }
+
+    fn exit_for_signal(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if !self.shutdown_requested.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+
+        if let Some(recorder) = &self.trace_recorder {
+            recorder.instant(
+                "native.main".to_string(),
+                "lifecycle",
+                "signal_exit",
+                BTreeMap::from([("signal".to_string(), "interrupt".to_string())]),
+            );
+        }
+        log::info!("shutdown signal received; exiting cleanly");
+        self.running = false;
+        event_loop.exit();
+        true
     }
 
     fn set_window_title(&mut self, title: String) {
@@ -707,6 +735,23 @@ fn resolve_trace_output_path(run_config: &RunConfig) -> PathBuf {
     ))
 }
 
+fn install_shutdown_signal_handlers() -> Result<Arc<AtomicBool>, String> {
+    let flag = SHUTDOWN_SIGNAL_FLAG
+        .get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone();
+    flag.store(false, Ordering::SeqCst);
+
+    if SHUTDOWN_SIGNAL_HANDLERS.get().is_none() {
+        signal_hook::flag::register(SIGINT, Arc::clone(&flag))
+            .map_err(|error| format!("Failed to register SIGINT handler: {error}"))?;
+        signal_hook::flag::register(SIGTERM, Arc::clone(&flag))
+            .map_err(|error| format!("Failed to register SIGTERM handler: {error}"))?;
+        let _ = SHUTDOWN_SIGNAL_HANDLERS.set(());
+    }
+
+    Ok(flag)
+}
+
 fn sanitize_trace_component(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -1006,6 +1051,9 @@ fn clear_target(ctx: &GpuContext, target: &OffscreenTarget, color: wgpu::Color) 
 
 impl ApplicationHandler for NativeApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_for_signal(event_loop) {
+            return;
+        }
         if self.window.is_some() {
             return;
         }
@@ -1040,6 +1088,9 @@ impl ApplicationHandler for NativeApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if self.exit_for_signal(event_loop) {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.running = false;

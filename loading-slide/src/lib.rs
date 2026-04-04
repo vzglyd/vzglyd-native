@@ -1,6 +1,8 @@
 use std::sync::LazyLock;
 
 use lume_slide::{Limits, SceneSpace, ShaderSources, SlideSpec, WorldLighting, WorldVertex};
+#[cfg(target_arch = "wasm32")]
+use lume_slide::{trace_scope, trace_scope_with_attrs};
 
 const WIRE_VERSION: u8 = 1;
 
@@ -41,7 +43,9 @@ lume_slide::params_buf!(64);
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn vzglyd_configure(_len: i32) -> i32 {
+    let mut trace = trace_scope_with_attrs("vzglyd_configure", &[("bytes", "0")]);
     // Loading slide has no configurable parameters.
+    trace.set_status("ok");
     0
 }
 
@@ -66,12 +70,16 @@ pub extern "C" fn vzglyd_abi_version() -> u32 {
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn vzglyd_init() -> i32 {
+    let mut trace = trace_scope("vzglyd_init");
+    trace.set_status("ok");
     0
 }
 
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn vzglyd_update(_dt: f32) -> i32 {
+    let mut trace = trace_scope_with_attrs("vzglyd_update", &[("dt_ms", "0")]);
+    trace.set_status("ok");
     0
 }
 

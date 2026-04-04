@@ -3311,11 +3311,25 @@ where
             memory
                 .write(&mut *store, ptr, &params[..write_len])
                 .map_err(|e| LoadError::WasmLoad(format!("write params failed: {e}")))?;
-            let status = cfg_fn
-                .call(&mut *store, write_len as i32)
-                .map_err(|error| {
-                    LoadError::WasmLoad(format!("vzglyd_configure failed: {error}"))
-                })?;
+            let mut trace = store.data().trace_recorder.clone().map(|recorder| {
+                let mut span = recorder.scoped(
+                    store.data().trace_thread.clone(),
+                    "runtime",
+                    "vzglyd_configure",
+                );
+                span.add_attr("bytes", write_len.to_string());
+                span
+            });
+            let status = cfg_fn.call(&mut *store, write_len as i32);
+            if let Some(trace) = trace.as_mut() {
+                match &status {
+                    Ok(code) => trace.add_attr("status_code", code.to_string()),
+                    Err(error) => trace.add_attr("error", error.to_string()),
+                }
+            }
+            let status = status.map_err(|error| {
+                LoadError::WasmLoad(format!("vzglyd_configure failed: {error}"))
+            })?;
             log::info!(
                 "slide:{} vzglyd_configure({write_len}) -> {status}",
                 store.data().label
@@ -3325,9 +3339,18 @@ where
 
     if let Ok(init) = instance.get_typed_func::<(), i32>(&mut *store, "vzglyd_init") {
         log::info!("slide:{} invoking vzglyd_init", store.data().label);
-        let status = init
-            .call(&mut *store, ())
-            .map_err(|error| LoadError::WasmLoad(format!("vzglyd_init failed: {error}")))?;
+        let mut trace = store.data().trace_recorder.clone().map(|recorder| {
+            recorder.scoped(store.data().trace_thread.clone(), "runtime", "vzglyd_init")
+        });
+        let status = init.call(&mut *store, ());
+        if let Some(trace) = trace.as_mut() {
+            match &status {
+                Ok(code) => trace.add_attr("status_code", code.to_string()),
+                Err(error) => trace.add_attr("error", error.to_string()),
+            }
+        }
+        let status =
+            status.map_err(|error| LoadError::WasmLoad(format!("vzglyd_init failed: {error}")))?;
         log::info!("slide:{} vzglyd_init -> {status}", store.data().label);
     }
 

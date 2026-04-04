@@ -33,6 +33,9 @@ cargo run -- --trace --scene /path/to/slide.vzglyd
 
 # Write the trace to a specific file
 cargo run -- --trace --trace-out /tmp/slide.perfetto.json --scene /path/to/slide.vzglyd
+
+# Trace an entire playlist / slides repo
+cargo run -- --trace --slides-dir slides/
 ```
 
 ## Shared Slides Repo
@@ -59,7 +62,11 @@ when you want to run one bundle directly without the shared repo contract.
 
 Use `--trace` to capture a Perfetto artifact and write it automatically on exit.
 Use `--trace-out <PATH>` to override the default output path under `./traces/`.
-The host prints the final artifact path when it flushes.
+The host prints the final artifact path when it flushes. Exit with `Ctrl-C`, close the window, or
+let the process terminate cleanly to write the file.
+
+Tracing is host-wide: every slide in a playlist gets host spans for load, configure, init, update,
+uploads, and render work even if the slide itself has not added any custom guest scopes yet.
 
 ## Architecture
 
