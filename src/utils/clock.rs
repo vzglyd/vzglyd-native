@@ -1,6 +1,7 @@
 //! Clock and time utilities.
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use chrono::{Local, Timelike};
 
 /// Returns the current time in seconds since UNIX epoch.
 pub fn now_secs() -> f64 {
@@ -19,13 +20,6 @@ pub fn now_secs() -> f64 {
 /// time in a specific timezone should derive it from `clock_seconds` plus an
 /// offset passed via the params system.
 pub fn local_clock_seconds() -> f32 {
-    let epoch_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let seconds_today = epoch_secs % 86_400;
-    let hour = (seconds_today / 3_600) as f32;
-    let minute = ((seconds_today / 60) % 60) as f32;
-    let second = (seconds_today % 60) as f32;
-    hour * 3_600.0 + minute * 60.0 + second
+    let now = Local::now();
+    (now.hour() * 3600 + now.minute() * 60 + now.second()) as f32
 }

@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "VRX-64-kernel"
 version = "0.1.0"
+source = "git+https://github.com/vzglyd/VRX-64-kernel?branch=main#9066a7eca9db1ea4ec90c3bef9aa4f48e012cbfe"
 dependencies = [
  "VRX-64-slide",
  "bytemuck",
@@ -26,6 +27,7 @@ dependencies = [
  "VRX-64-sidecar",
  "VRX-64-slide",
  "bytemuck",
+ "chrono",
  "drm",
  "env_logger",
  "glam",
@@ -51,6 +53,7 @@ dependencies = [
 [[package]]
 name = "VRX-64-sidecar"
 version = "0.1.0"
+source = "git+https://github.com/vzglyd/VRX-64-sidecar?branch=main#096243bf2b723501d53081e6032231e070b34c37"
 dependencies = [
  "rustls",
  "rustls-pki-types",
@@ -63,6 +66,7 @@ dependencies = [
 [[package]]
 name = "VRX-64-slide"
 version = "0.1.0"
+source = "git+https://github.com/vzglyd/VRX-64-slide?branch=main#1b13d95e933f84b763a7c62abe708268b1329c69"
 dependencies = [
  "bytemuck",
  "serde",
@@ -608,6 +612,19 @@ dependencies = [
  "cipher",
  "poly1305",
  "zeroize",
+]
+
+[[package]]
+name = "chrono"
+version = "0.4.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
+dependencies = [
+ "iana-time-zone",
+ "js-sys",
+ "num-traits",
+ "wasm-bindgen",
+ "windows-link",
 ]
 
 [[package]]

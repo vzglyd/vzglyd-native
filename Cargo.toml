@@ -60,6 +60,8 @@ once_cell = "1"
 pollster = "0.3"
 signal-hook = "0.3"
 
+chrono = "0.4"
+
 # Linux-specific
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.15"
