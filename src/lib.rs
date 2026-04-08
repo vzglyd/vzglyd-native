@@ -8,6 +8,7 @@
 //! - std::fs for asset loading
 
 pub mod app;
+pub mod server;
 pub mod assets;
 pub mod gpu;
 pub mod render;

@@ -62,6 +62,11 @@ signal-hook = "0.3"
 
 chrono = "0.4"
 
+# Management HTTP server
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "multipart", "tokio"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "fs", "macros"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
 # Linux-specific
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.15"

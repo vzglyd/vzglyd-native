@@ -8,7 +8,7 @@
 use bytemuck::cast_slice;
 use chrono::Local;
 use std::sync::Arc;
-use vzglyd_kernel::{OverlayVertex, build_font_atlas_pixels, build_hud_geometry};
+use vzglyd_kernel::{OverlayVertex, build_font_atlas_pixels, build_hud_geometry, build_screensaver_geometry, ScreensaverFrameState};
 
 use crate::gpu::context::GpuContext;
 
@@ -264,6 +264,76 @@ impl OverlayRenderer {
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("overlay_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_viewport(vp_x as f32, vp_y as f32, sw as f32, sh as f32, 0.0, 1.0);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+    }
+
+    /// Records the screensaver overlay pass into `encoder`, targeting `view`.
+    ///
+    /// Renders the full-screen intermission geometry (black background + drifting
+    /// "Intermission" text + countdown) using the same pipeline as [`record_pass`].
+    /// Call this instead of [`record_pass`] when the screensaver is active; no
+    /// slide blit is needed beforehand since the geometry includes a full-screen
+    /// black background quad.
+    pub fn record_screensaver_pass(
+        &mut self,
+        ctx: &GpuContext,
+        view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+        state: &ScreensaverFrameState,
+        blit_rect: (u32, u32, u32, u32),
+    ) {
+        let (vp_x, vp_y, sw, sh) = blit_rect;
+
+        let (vertices, indices) = build_screensaver_geometry(
+            &self.glyph_map,
+            sw,
+            sh,
+            state.elapsed_secs,
+            state.remaining_secs,
+        );
+
+        if vertices.len() > self.vertex_capacity {
+            self.vertex_capacity = vertices.len().next_power_of_two();
+            self.vertex_buffer = Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay_vertex_buffer"),
+                size: (self.vertex_capacity * std::mem::size_of::<OverlayVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        if indices.len() > self.index_capacity {
+            self.index_capacity = indices.len().next_power_of_two();
+            self.index_buffer = Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay_index_buffer"),
+                size: (self.index_capacity * std::mem::size_of::<u16>()) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
+        ctx.queue.write_buffer(&self.vertex_buffer, 0, cast_slice(&vertices));
+        ctx.queue.write_buffer(&self.index_buffer, 0, cast_slice(&indices));
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("screensaver_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,

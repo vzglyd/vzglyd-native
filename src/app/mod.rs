@@ -7,8 +7,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use vzglyd_kernel::SecretsStore;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use vzglyd_kernel::TransitionKind as KernelTransitionKind;
 use vzglyd_kernel::schedule::{PLAYLIST_FILENAME, Playlist, parse_playlist};
@@ -32,6 +34,7 @@ use crate::render::{
     LoadedSlide, OverlayRenderer, SlideRenderer, TransitionKind, TransitionRenderer,
     create_loaded_slide_renderer, load_wasm_slide, load_wasm_slide_from_bytes,
 };
+use crate::server::{AppStatus, start_server};
 use vzglyd_kernel::manifest::SlideManifest;
 use crate::trace::set_active_trace_recorder;
 
@@ -98,6 +101,15 @@ pub struct NativeApp {
     pending_rx: Option<Receiver<Result<PendingSlide, (usize, String, String)>>>,
     trace_recorder: Option<vzglyd_kernel::trace::TraceRecorder>,
     shutdown_requested: Arc<AtomicBool>,
+    /// Secrets (API keys etc.) injected into sidecar WASI environments.
+    pub secrets: Arc<RwLock<SecretsStore>>,
+    /// Receives new playlist JSON from the management server for hot-reload.
+    playlist_reload_rx: Option<Receiver<String>>,
+    /// Shared status written each frame; read by the management server.
+    app_status: Arc<RwLock<AppStatus>>,
+    /// Frame counter and time for rolling FPS calculation.
+    fps_frame_count: u32,
+    fps_window_start: Option<Instant>,
 }
 
 /// Loaded slide renderer with metadata and the optional extracted archive directory.
@@ -194,6 +206,11 @@ impl NativeApp {
             pending_rx: None,
             trace_recorder,
             shutdown_requested,
+            secrets: Arc::new(RwLock::new(SecretsStore::default())),
+            playlist_reload_rx: None,
+            app_status: Arc::new(RwLock::new(AppStatus::default())),
+            fps_frame_count: 0,
+            fps_window_start: None,
         })
     }
 
@@ -204,6 +221,35 @@ impl NativeApp {
         event_loop.set_control_flow(ControlFlow::Poll);
 
         let mut app = Self::new(run_config)?;
+
+        // Load secrets from slides_dir/secrets.json (single-threaded, safe to use set_var here).
+        if let Some(dir) = app.run_config.slides_dir.as_deref() {
+            match crate::server::load_secrets(std::path::Path::new(dir)) {
+                Ok(secrets) => {
+                    if !secrets.is_empty() {
+                        eprintln!("[vzglyd] loaded {} secret(s) from secrets.json", secrets.len());
+                    }
+                    // Safety: single-threaded at this point (before EventLoop::run_app).
+                    for (key, val) in &secrets.0 {
+                        #[allow(unused_unsafe)]
+                        unsafe { std::env::set_var(key, val) };
+                    }
+                    if let Ok(mut guard) = app.secrets.write() {
+                        *guard = secrets;
+                    }
+                }
+                Err(e) => log::warn!("failed to load secrets.json: {e}"),
+            }
+        }
+
+        // Start the management HTTP server on port 8080 (only when slides_dir is set).
+        if let Some(dir) = app.run_config.slides_dir.as_deref() {
+            let slides_dir = std::path::PathBuf::from(dir);
+            let (_handle, playlist_rx, app_status) =
+                start_server(slides_dir, Arc::clone(&app.secrets));
+            app.playlist_reload_rx = Some(playlist_rx);
+            app.app_status = app_status;
+        }
 
         // Resolve slide paths and build kernel schedule before the event loop starts.
         if let Some(mut engine) = app.engine.take() {
@@ -336,6 +382,7 @@ impl NativeApp {
         self.pending_rx = Some(rx);
 
         let slides = self.slides.clone();
+        let secrets = Arc::clone(&self.secrets);
 
         eprintln!(
             "[vzglyd] spawning background loader for {} slide(s)",
@@ -343,9 +390,14 @@ impl NativeApp {
         );
 
         std::thread::spawn(move || {
+            // Snapshot secrets once for this loader batch.
+            let extra_env: Vec<(String, String)> = secrets
+                .read()
+                .map(|s| s.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
             for (idx, slide) in slides.iter().enumerate() {
                 eprintln!("[loader] {}/{}: {}", idx + 1, slides.len(), slide.path);
-                let result = load_slide_package(idx, slide);
+                let result = load_slide_package(idx, slide, &extra_env);
                 let send_result = tx.send(result);
                 if send_result.is_err() {
                     // Main thread dropped the receiver — exit early.
@@ -414,6 +466,94 @@ impl NativeApp {
             self.bootstrap_renderer = None;
             self.bootstrap_target = None;
         }
+    }
+
+    /// Drain the playlist hot-reload channel and apply any pending new playlist.
+    ///
+    /// Called once per frame. If a new playlist JSON string is received from
+    /// the management server, the schedule is re-resolved and the background
+    /// WASM compilation is restarted.
+    fn poll_playlist_reload(&mut self) {
+        let Some(rx) = &self.playlist_reload_rx else {
+            return;
+        };
+
+        // Drain all pending messages, keep only the latest.
+        let mut latest: Option<String> = None;
+        loop {
+            match rx.try_recv() {
+                Ok(json) => {
+                    latest = Some(json);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.playlist_reload_rx = None;
+                    break;
+                }
+            }
+        }
+
+        let Some(json) = latest else { return };
+
+        let Some(slides_dir) = self.run_config.slides_dir.as_deref() else {
+            return;
+        };
+
+        match vzglyd_kernel::schedule::parse_playlist(json.as_bytes()) {
+            Ok(playlist) => {
+                log::info!("[hot-reload] applying new playlist ({} slides)", playlist.slides.len());
+
+                if let Some(mut engine) = self.engine.take() {
+                    engine.set_schedule_from_playlist(&playlist, slides_dir);
+                    self.display_scale = playlist.display_scale;
+                    self.slides = schedule_snapshot(&engine);
+                    self.engine = Some(engine);
+                }
+
+                // Clear all existing renderers and restart background loading.
+                self.slide_renderers.clear();
+                self.offscreen_targets.clear();
+                self.pending_rx = None;
+                self.bootstrap_renderer = None;
+                self.bootstrap_target = None;
+                self.start_background_load();
+                self.try_init_bootstrap_renderer();
+            }
+            Err(e) => {
+                log::warn!("[hot-reload] received invalid playlist JSON: {e}");
+            }
+        }
+    }
+
+    /// Update the shared AppStatus with the current FPS (rolling 1-second window).
+    fn update_fps_status(&mut self, dt: f32) {
+        self.fps_frame_count += 1;
+        let now = Instant::now();
+        let window_start = self.fps_window_start.get_or_insert(now);
+        let elapsed = now.duration_since(*window_start).as_secs_f32();
+
+        if elapsed >= 1.0 {
+            let fps = self.fps_frame_count as f32 / elapsed;
+            self.fps_frame_count = 0;
+            self.fps_window_start = Some(now);
+
+            let current_slide = self
+                .slides
+                .first()
+                .map(|s| {
+                    std::path::Path::new(&s.path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&s.path)
+                        .to_string()
+                });
+
+            if let Ok(mut status) = self.app_status.write() {
+                status.fps = fps;
+                status.current_slide = current_slide;
+            }
+        }
+        let _ = dt;
     }
 
     /// Ensures an offscreen target exists at `idx`, creating it if needed.
@@ -524,6 +664,15 @@ impl NativeApp {
 
         if frame_state.total_slides == 0 {
             self.render_blank();
+            return;
+        }
+
+        // Screensaver mode: suppress the normal slide and HUD border.
+        if let Some(ss_state) = frame_state.screensaver.clone() {
+            self.render_screensaver(&ss_state);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
             return;
         }
 
@@ -654,6 +803,25 @@ impl NativeApp {
         window.request_redraw();
     }
 
+    /// Renders the screensaver frame — suppresses the slide and HUD border,
+    /// showing the full-screen intermission scene instead.
+    fn render_screensaver(&mut self, state: &vzglyd_kernel::ScreensaverFrameState) {
+        let ctx = match &self.context {
+            Some(c) => c,
+            None => return,
+        };
+        let Some(overlay) = self.overlay_renderer.as_mut() else {
+            return;
+        };
+        let blit_rect = ctx.surface_display_rect();
+        let result = ctx.clear_and_overlay_to_surface(|view, encoder| {
+            overlay.record_screensaver_pass(ctx, view, encoder, state, blit_rect);
+        });
+        if let Err(error) = result {
+            self.handle_surface_error(error);
+        }
+    }
+
     /// Renders a blank (dark) frame — shown while slides are still loading.
     fn render_blank(&mut self) {
         let ctx = match &self.context {
@@ -720,6 +888,7 @@ impl Drop for NativeApp {
 fn load_slide_package(
     idx: usize,
     slide: &ScheduledSlide,
+    extra_env: &[(String, String)],
 ) -> Result<PendingSlide, (usize, String, String)> {
     macro_rules! bail {
         ($msg:expr) => {
@@ -731,7 +900,7 @@ fn load_slide_package(
         .params
         .as_ref()
         .map(|value| serde_json::to_vec(value).expect("params serialization is infallible"));
-    let (loaded, manifest) = match load_wasm_slide(&slide.path, params_bytes.as_deref()) {
+    let (loaded, manifest) = match load_wasm_slide(&slide.path, params_bytes.as_deref(), extra_env) {
         Ok(loaded) => loaded,
         Err(error) => bail!(format!("slide load failed: {error}")),
     };
@@ -1164,6 +1333,12 @@ impl ApplicationHandler for NativeApp {
 
                 // Collect any newly-compiled slides.
                 self.poll_pending_slides();
+
+                // Check for playlist hot-reload from management server.
+                self.poll_playlist_reload();
+
+                // Update FPS in shared AppStatus.
+                self.update_fps_status(dt);
 
                 // While the bootstrap loading scene is visible, keep the kernel's
                 // schedule frozen so the first real slide starts at t=0 once the

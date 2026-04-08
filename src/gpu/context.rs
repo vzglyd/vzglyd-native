@@ -576,6 +576,53 @@ impl GpuContext {
         Ok(())
     }
 
+    /// Clears the surface to black and records an overlay pass into the same encoder.
+    ///
+    /// Used for the screensaver path where no slide is blitted — the overlay
+    /// geometry provides its own full-screen background.
+    pub fn clear_and_overlay_to_surface<F>(
+        &self,
+        record_overlay: F,
+    ) -> Result<(), wgpu::SurfaceError>
+    where
+        F: FnOnce(&wgpu::TextureView, &mut wgpu::CommandEncoder),
+    {
+        let frame = self.surface.get_current_texture()?;
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("screensaver_encoder"),
+            });
+
+        {
+            // Clear to black. The screensaver geometry draws on top with LoadOp::Load.
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("screensaver_clear_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+        }
+
+        record_overlay(&view, &mut encoder);
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        Ok(())
+    }
+
     /// Calculates the blit rect for letterbox/pillarbox scaling.
     pub fn surface_blit_rect(&self) -> (u32, u32, u32, u32) {
         let surface_width = self.config.width.max(1);

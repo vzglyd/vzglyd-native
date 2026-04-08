@@ -827,14 +827,18 @@ impl OverlayRuntime {
             return;
         }
 
-        let used_vertices = overlay
+        // Align to quad boundaries: each quad contributes exactly 4 vertices and 6 indices.
+        // Truncating mid-quad would leave dangling index references.
+        let used_vertices = (overlay
             .vertices
             .len()
-            .min(self.buffers.vertex_capacity as usize);
-        let used_indices = overlay
+            .min(self.buffers.vertex_capacity as usize))
+            / 4 * 4;
+        let used_indices = (overlay
             .indices
             .len()
-            .min(self.buffers.index_capacity as usize);
+            .min(self.buffers.index_capacity as usize))
+            / 6 * 6;
         ctx.queue.write_buffer(
             &self.buffers.vertex_buffer,
             0,
@@ -1555,14 +1559,13 @@ fn create_screen_slide_pipelines(
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
+                    cull_mode: None, // 2D quads always face the camera; culling not needed
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: crate::gpu::context::DEPTH_FORMAT,
                     depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    depth_compare: wgpu::CompareFunction::Always, // 2D quads render unconditionally
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -1633,14 +1636,15 @@ pub fn load_wasm_slide_from_bytes(
     bytes: &[u8],
 ) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
     let extracted = slide_loader::extract_embedded_bytes_to_cache(bytes)?;
-    load_wasm_slide(&extracted.to_string_lossy(), None)
+    load_wasm_slide(&extracted.to_string_lossy(), None, &[])
 }
 
 pub fn load_wasm_slide(
     path: &str,
     params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
 ) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
-    if let Ok((slide, manifest)) = load_screen_wasm_slide(path, params_bytes) {
+    if let Ok((slide, manifest)) = load_screen_wasm_slide(path, params_bytes, extra_env) {
         if let LoadedSlide::Screen(screen) = &slide {
             if screen.spec.scene_space == SceneSpace::Screen2D && screen.spec.validate().is_ok() {
                 return Ok((slide, Some(manifest)));
@@ -1648,7 +1652,7 @@ pub fn load_wasm_slide(
         }
     }
 
-    let (loaded, manifest) = load_spec_with_manifest::<WorldVertex>(path, params_bytes)?;
+    let (loaded, manifest) = load_spec_with_manifest::<WorldVertex>(path, params_bytes, extra_env)?;
     Ok((
         LoadedSlide::World(LoadedWorldSlide {
             spec: loaded.spec,
@@ -1662,8 +1666,9 @@ pub fn load_wasm_slide(
 fn load_screen_wasm_slide(
     path: &str,
     params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
 ) -> Result<(LoadedSlide, SlideManifest), LoadError> {
-    let (loaded, manifest) = load_spec_with_manifest::<ScreenVertex>(path, params_bytes)?;
+    let (loaded, manifest) = load_spec_with_manifest::<ScreenVertex>(path, params_bytes, extra_env)?;
     Ok((
         LoadedSlide::Screen(LoadedScreenSlide {
             spec: loaded.spec,
@@ -1677,6 +1682,7 @@ fn load_screen_wasm_slide(
 fn load_spec_with_manifest<V>(
     path: &str,
     params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
 ) -> Result<(slide_loader::LoadedSpec<V>, SlideManifest), LoadError>
 where
     V: slide_loader::PackageMeshVertex,
@@ -1684,9 +1690,9 @@ where
     if Path::new(path).extension().and_then(|ext| ext.to_str())
         == Some(slide_loader::PACKAGE_ARCHIVE_EXTENSION)
     {
-        slide_loader::load_slide_from_archive(path, params_bytes)
+        slide_loader::load_slide_from_archive(path, params_bytes, extra_env)
     } else {
-        slide_loader::load_slide_from_wasm(path, params_bytes)
+        slide_loader::load_slide_from_wasm(path, params_bytes, extra_env)
     }
 }
 

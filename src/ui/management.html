@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>VRX-64 Management</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  --bg: #07121d; --bg-deep: #03080f;
+  --surface: rgba(10,20,32,0.92); --surface-strong: rgba(16,29,46,0.98);
+  --border: rgba(112,167,214,0.22); --border-strong: rgba(112,167,214,0.4);
+  --text: #edf5ff; --text-dim: #9eb5cc;
+  --accent: #66c3ff; --accent-warm: #ffd07a;
+  --success: #73d69c; --warning: #ffca6b;
+  --error-bg: rgba(71,17,21,0.88); --error-border: rgba(255,112,120,0.4);
+  --radius: 14px;
+}
+
+html, body { min-height: 100%; margin: 0; }
+body {
+  background: radial-gradient(circle at top, rgba(0,194,255,0.18), transparent 38%),
+              linear-gradient(180deg, var(--bg) 0%, var(--bg-deep) 100%);
+  color: var(--text);
+  font-family: "Avenir Next","Segoe UI","Helvetica Neue",sans-serif;
+  font-size: 15px; line-height: 1.5;
+}
+
+/* ── Layout ── */
+#layout {
+  display: grid;
+  grid-template-columns: minmax(360px,480px) 1fr;
+  grid-template-rows: auto 1fr;
+  min-height: 100vh;
+}
+
+#header {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 1rem 1.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+#header h1 { margin: 0; font-size: 1.4rem; letter-spacing: -0.03em; }
+#header .eyebrow { margin: 0; font-size: 0.72rem; text-transform: uppercase;
+  letter-spacing: 0.14em; color: var(--accent-warm); }
+#status-badge {
+  font-size: 0.78rem; color: var(--text-dim);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 999px; padding: 0.2rem 0.75rem;
+}
+
+/* ── Left panel ── */
+#left-panel {
+  overflow-y: auto; padding: 1rem 1rem 2rem;
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 1rem;
+}
+
+/* ── Right panel ── */
+#right-panel {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: flex-start; padding: 1rem; background: #020a11;
+  gap: 0.75rem;
+}
+#preview-label { font-size: 0.8rem; color: var(--text-dim); }
+#view-canvas {
+  width: 640px; max-width: 100%; aspect-ratio: 640/480;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: #000;
+}
+#preview-status { font-size: 0.8rem; color: var(--text-dim); }
+
+/* ── Panels ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+}
+.card-head { display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 0.75rem; }
+.card-head h2 { margin: 0; font-size: 1rem; }
+.card-head .hint { margin: 0.2rem 0 0; font-size: 0.82rem; color: var(--text-dim); }
+
+/* ── Buttons ── */
+button, .btn {
+  cursor: pointer; border: none; border-radius: 8px; font-size: 0.85rem;
+  padding: 0.45rem 0.9rem; transition: opacity 0.15s;
+}
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+.primary-btn { background: var(--accent); color: #021522; font-weight: 600; }
+.primary-btn:hover:not(:disabled) { opacity: 0.85; }
+.secondary-btn { background: var(--surface-strong); color: var(--text);
+  border: 1px solid var(--border); }
+.secondary-btn:hover:not(:disabled) { border-color: var(--border-strong); }
+.icon-btn { background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); padding: 0.3rem 0.6rem; }
+.icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.danger-btn { background: var(--error-bg); color: #ff8a8f;
+  border: 1px solid var(--error-border); }
+
+.btn-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+
+/* ── Forms ── */
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+.field { display: flex; flex-direction: column; gap: 0.25rem; }
+.field.is-wide { grid-column: 1 / -1; }
+.field > span { font-size: 0.8rem; color: var(--text-dim); }
+input, select, textarea {
+  background: var(--bg-deep); color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 0.4rem 0.6rem; font-size: 0.88rem; width: 100%;
+  font-family: inherit;
+}
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid var(--accent); border-color: var(--accent);
+}
+textarea { resize: vertical; min-height: 80px; }
+.field-note { margin: 0.15rem 0 0; font-size: 0.77rem; color: var(--text-dim); }
+.field-note.is-error { color: #ff8a8f; }
+.field-note.is-warning { color: var(--warning); }
+
+/* ── Entry cards ── */
+.editor-entry {
+  background: var(--surface-strong); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 0.85rem 1rem; margin-bottom: 0.5rem;
+}
+.editor-entry.is-selected { border-color: var(--accent); }
+.entry-topline { display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 0.5rem; }
+.entry-index { font-size: 0.78rem; color: var(--accent-warm); font-weight: 600; }
+.entry-actions { display: flex; gap: 0.35rem; }
+.entry-summary { margin-bottom: 0.6rem; }
+.entry-summary-title { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.2rem; }
+.badge-row { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.badge-pill {
+  background: rgba(102,195,255,0.12); color: var(--accent);
+  border-radius: 999px; font-size: 0.72rem; padding: 0.1rem 0.55rem;
+  border: 1px solid rgba(102,195,255,0.2);
+}
+
+/* ── Entry params ── */
+.entry-params-shell { margin-top: 0.6rem; padding-top: 0.6rem;
+  border-top: 1px solid var(--border); }
+.entry-params-head { display: flex; align-items: flex-start;
+  justify-content: space-between; margin-bottom: 0.5rem; }
+.entry-params-head h3 { margin: 0; font-size: 0.88rem; }
+.entry-params-head .hint { margin: 0.1rem 0 0; font-size: 0.78rem; color: var(--text-dim); }
+
+/* ── Secrets ── */
+.secret-row { display: flex; gap: 0.5rem; align-items: flex-end; }
+.secret-row .field { flex: 1; }
+.secret-key-badge {
+  display: inline-block; background: rgba(255,208,122,0.12);
+  color: var(--accent-warm); border: 1px solid rgba(255,208,122,0.25);
+  border-radius: 6px; font-size: 0.8rem; padding: 0.2rem 0.6rem;
+  margin: 0.15rem 0.15rem 0 0;
+}
+
+/* ── Status/error ── */
+#toast {
+  position: fixed; bottom: 1.25rem; left: 50%; transform: translateX(-50%);
+  background: var(--surface-strong); border: 1px solid var(--border-strong);
+  border-radius: 10px; padding: 0.55rem 1.25rem; font-size: 0.88rem;
+  color: var(--text); box-shadow: 0 8px 32px rgba(0,0,0,0.5); z-index: 100;
+  display: none;
+}
+#toast.is-error { background: var(--error-bg); border-color: var(--error-border); color: #ff8a8f; }
+#toast.is-success { border-color: rgba(115,214,156,0.4); color: var(--success); }
+
+/* ── Upload drop zone ── */
+.drop-zone {
+  border: 2px dashed var(--border); border-radius: var(--radius);
+  padding: 0.75rem 1rem; text-align: center; font-size: 0.84rem;
+  color: var(--text-dim); cursor: pointer; transition: border-color 0.2s;
+}
+.drop-zone.is-over { border-color: var(--accent); color: var(--accent); }
+.drop-zone input[type=file] { display: none; }
+
+/* ── Secrets warning ── */
+.secrets-warning {
+  background: rgba(255,208,122,0.1); border: 1px solid rgba(255,208,122,0.3);
+  border-radius: 8px; padding: 0.55rem 0.8rem; font-size: 0.82rem;
+  color: var(--accent-warm);
+}
+</style>
+</head>
+<body>
+<div id="layout">
+  <!-- Header -->
+  <header id="header">
+    <div>
+      <p class="eyebrow">VRX-64 Management</p>
+      <h1>Display Control</h1>
+    </div>
+    <div class="btn-row">
+      <span id="status-badge">connecting…</span>
+      <button class="secondary-btn" id="save-btn" disabled>Save playlist</button>
+    </div>
+  </header>
+
+  <!-- Left panel: editor + secrets + library -->
+  <div id="left-panel">
+
+    <!-- Defaults -->
+    <div class="card" id="defaults-card">
+      <div class="card-head">
+        <div>
+          <h2>Defaults</h2>
+          <p class="hint">Applied when a slide does not specify its own value.</p>
+        </div>
+      </div>
+      <div class="form-grid">
+        <label class="field">
+          <span>Default duration (s)</span>
+          <input id="default-duration" type="number" min="1" max="300" placeholder="7" />
+        </label>
+        <label class="field">
+          <span>Display scale</span>
+          <input id="display-scale" type="number" min="0" max="2" step="0.05" placeholder="1.0" />
+        </label>
+        <label class="field">
+          <span>Transition in</span>
+          <select id="default-transition-in"></select>
+        </label>
+        <label class="field">
+          <span>Transition out</span>
+          <select id="default-transition-out"></select>
+        </label>
+      </div>
+    </div>
+
+    <!-- Slide list -->
+    <div class="card">
+      <div class="card-head">
+        <div><h2>Slides</h2><p class="hint">Drag to reorder. Click a slide to preview it.</p></div>
+        <button class="secondary-btn" id="add-entry-btn">+ Add</button>
+      </div>
+      <div id="entry-list"></div>
+    </div>
+
+    <!-- Slide library (upload + available bundles) -->
+    <div class="card">
+      <div class="card-head">
+        <div><h2>Slide Library</h2><p class="hint">Available .vzglyd bundles. Click to add to playlist.</p></div>
+        <button class="secondary-btn" id="refresh-library-btn">Refresh</button>
+      </div>
+      <label class="drop-zone" id="drop-zone">
+        <input type="file" id="upload-input" accept=".vzglyd" multiple />
+        Drop .vzglyd files here, or click to upload
+      </label>
+      <div id="library-list" style="margin-top:0.6rem"></div>
+    </div>
+
+    <!-- Secrets -->
+    <div class="card">
+      <div class="card-head">
+        <div><h2>Secrets</h2><p class="hint">API keys for slides. Never exposed in logs.</p></div>
+        <button class="secondary-btn" id="export-secrets-btn" title="Download secrets.json for use with the web editor">Export secrets.json</button>
+      </div>
+      <div class="secrets-warning">
+        ⚠ Do not commit <code>secrets.json</code> to a public repository.
+      </div>
+      <div id="secrets-list" style="margin-top:0.75rem"></div>
+      <div class="secret-row" style="margin-top:0.6rem">
+        <label class="field">
+          <span>Key</span>
+          <input id="new-secret-key" type="text" placeholder="LASTFM_API_KEY" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>Value</span>
+          <input id="new-secret-value" type="password" placeholder="••••••••" autocomplete="new-password" />
+        </label>
+        <button class="secondary-btn" id="add-secret-btn" style="margin-bottom:0">Set</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Right panel: preview -->
+  <div id="right-panel">
+    <p id="preview-label">Select a slide to preview</p>
+    <canvas id="view-canvas" width="640" height="480"></canvas>
+    <p id="preview-status"></p>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script type="module">
+// ═══════════════════════════════════════════════════════════════════════════════
+// Inlined playlist_repo.js (adapted — no ES module imports, no repo URL)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const MIN_DISPLAY_DURATION_SECONDS = 1;
+const MAX_DISPLAY_DURATION_SECONDS = 300;
+const TRANSITION_OPTIONS = ['crossfade', 'wipe_left', 'wipe_down', 'dissolve', 'cut'];
+
+function isPlainObject(v) { return v != null && typeof v === 'object' && !Array.isArray(v); }
+
+function normalizeOptionalDuration(value, label) {
+  if (value == null) return undefined;
+  const s = Number(value);
+  if (!Number.isInteger(s) || s < MIN_DISPLAY_DURATION_SECONDS || s > MAX_DISPLAY_DURATION_SECONDS)
+    throw new Error(`${label} must be an integer from ${MIN_DISPLAY_DURATION_SECONDS} to ${MAX_DISPLAY_DURATION_SECONDS}`);
+  return s;
+}
+
+function normalizeOptionalTransition(value, label) {
+  if (value == null) return undefined;
+  const t = String(value).trim();
+  if (!t) throw new Error(`${label} must be a non-empty string`);
+  if (!TRANSITION_OPTIONS.includes(t)) throw new Error(`${label} must be one of: ${TRANSITION_OPTIONS.join(', ')}`);
+  return t;
+}
+
+function validateBundlePath(path, label = 'path') {
+  if (typeof path !== 'string' || !path.trim()) throw new Error(`${label} must be a non-empty string`);
+  const t = path.trim();
+  if (t.startsWith('/')) throw new Error(`${label} must be relative`);
+  if (t.includes('\\')) throw new Error(`${label} must use forward slashes`);
+  if (t.split('/').some(s => s === '.' || s === '..')) throw new Error(`${label} must not contain . or .. segments`);
+  if (!t.endsWith('.vzglyd')) throw new Error(`${label} must point to a .vzglyd bundle`);
+  return t;
+}
+
+function normalizeDefaults(d) {
+  if (!d) return {};
+  const out = {};
+  const dur = normalizeOptionalDuration(d.duration_seconds, 'defaults.duration_seconds');
+  const ti = normalizeOptionalTransition(d.transition_in, 'defaults.transition_in');
+  const to = normalizeOptionalTransition(d.transition_out, 'defaults.transition_out');
+  if (dur != null) out.duration_seconds = dur;
+  if (ti != null) out.transition_in = ti;
+  if (to != null) out.transition_out = to;
+  return out;
+}
+
+function normalizeEntry(e, i) {
+  if (!isPlainObject(e)) throw new Error(`slides[${i}] must be an object`);
+  const out = { path: validateBundlePath(e.path, `slides[${i}].path`) };
+  if (e.enabled === false) out.enabled = false;
+  const dur = normalizeOptionalDuration(e.duration_seconds, `slides[${i}].duration_seconds`);
+  if (dur != null) out.duration_seconds = dur;
+  const ti = normalizeOptionalTransition(e.transition_in, `slides[${i}].transition_in`);
+  if (ti != null) out.transition_in = ti;
+  const to = normalizeOptionalTransition(e.transition_out, `slides[${i}].transition_out`);
+  if (to != null) out.transition_out = to;
+  if (e.params !== undefined) out.params = e.params;
+  return out;
+}
+
+function validatePlaylist(p) {
+  if (!isPlainObject(p)) throw new Error('playlist.json must be an object');
+  if (!Array.isArray(p.slides)) throw new Error('playlist.json must have a slides array');
+  return { ...p, defaults: normalizeDefaults(p.defaults), slides: p.slides.map(normalizeEntry) };
+}
+
+function parseParamsText(text) {
+  if (!text || !text.trim()) return undefined;
+  return JSON.parse(text);
+}
+
+function toEditablePlaylist(playlist) {
+  const v = validatePlaylist(playlist);
+  return {
+    defaults: {
+      duration_seconds: v.defaults.duration_seconds != null ? String(v.defaults.duration_seconds) : '',
+      transition_in: v.defaults.transition_in ?? '',
+      transition_out: v.defaults.transition_out ?? '',
+    },
+    display_scale: String(v.display_scale ?? '1.0'),
+    slides: v.slides.map(e => ({
+      path: e.path,
+      enabled: e.enabled !== false,
+      duration_seconds: e.duration_seconds != null ? String(e.duration_seconds) : '',
+      transition_in: e.transition_in ?? '',
+      transition_out: e.transition_out ?? '',
+      params_text: e.params !== undefined ? JSON.stringify(e.params, null, 2) : '',
+      params_editor_mode: 'raw',
+      params_form_values: {},
+      params_schema: null,
+      params_editor_message: '',
+      bundle_manifest: null,
+      bundle_manifest_status: 'idle',
+      bundle_error: '',
+    })),
+  };
+}
+
+function emptyEditableEntry() {
+  return {
+    path: '', enabled: true, duration_seconds: '', transition_in: '', transition_out: '',
+    params_text: '', params_editor_mode: 'raw', params_form_values: {}, params_schema: null,
+    params_editor_message: '', bundle_manifest: null, bundle_manifest_status: 'idle', bundle_error: '',
+  };
+}
+
+function serializeEditablePlaylist(ep) {
+  const defaults = {};
+  const dur = normalizeOptionalDuration(ep.defaults.duration_seconds || null, 'defaults.duration_seconds');
+  if (dur != null) defaults.duration_seconds = dur;
+  const ti = normalizeOptionalTransition(ep.defaults.transition_in || null, 'defaults.transition_in');
+  if (ti != null) defaults.transition_in = ti;
+  const to = normalizeOptionalTransition(ep.defaults.transition_out || null, 'defaults.transition_out');
+  if (to != null) defaults.transition_out = to;
+
+  const slides = ep.slides.map((e, i) => {
+    const item = { path: validateBundlePath(e.path, `slides[${i}].path`) };
+    if (e.enabled === false) item.enabled = false;
+    const d = normalizeOptionalDuration(e.duration_seconds || null, `slides[${i}].duration_seconds`);
+    if (d != null) item.duration_seconds = d;
+    const eti = normalizeOptionalTransition(e.transition_in || null, `slides[${i}].transition_in`);
+    if (eti != null) item.transition_in = eti;
+    const eto = normalizeOptionalTransition(e.transition_out || null, `slides[${i}].transition_out`);
+    if (eto != null) item.transition_out = eto;
+    const params = parseParamsText(e.params_text);
+    if (params !== undefined) item.params = params;
+    return item;
+  });
+
+  const display_scale = parseFloat(ep.display_scale || '1.0');
+  return validatePlaylist({ defaults, display_scale: isFinite(display_scale) ? display_scale : 1.0, slides });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// param_schema.js (inlined, essential parts)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function describeParamField(field) {
+  const defaultText = field.default === undefined ? '' :
+    (typeof field.default === 'string' ? field.default : JSON.stringify(field.default));
+  return { label: field.label ?? field.key, help: field.help ?? '', defaultText };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// API helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function apiGet(path) {
+  const r = await fetch(path);
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error(j.error || `${r.status} ${r.statusText}`);
+  }
+  return r.json();
+}
+
+async function apiPost(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error(j.error || `${r.status} ${r.statusText}`);
+  }
+  return r.json();
+}
+
+async function apiPostRaw(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new Error(j.error || `${r.status} ${r.statusText}`);
+  }
+  return r.json();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// App state
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const state = {
+  editablePlaylist: null,
+  savedJson: '',
+  secretKeys: [],
+  library: [],
+  selectedIndex: null,
+  previewHost: null,
+  previewLoading: false,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOM refs
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const statusBadge = document.getElementById('status-badge');
+const saveBtn = document.getElementById('save-btn');
+const defaultDuration = document.getElementById('default-duration');
+const displayScale = document.getElementById('display-scale');
+const defaultTransitionIn = document.getElementById('default-transition-in');
+const defaultTransitionOut = document.getElementById('default-transition-out');
+const entryList = document.getElementById('entry-list');
+const addEntryBtn = document.getElementById('add-entry-btn');
+const libraryList = document.getElementById('library-list');
+const refreshLibraryBtn = document.getElementById('refresh-library-btn');
+const uploadInput = document.getElementById('upload-input');
+const dropZone = document.getElementById('drop-zone');
+const secretsList = document.getElementById('secrets-list');
+const newSecretKey = document.getElementById('new-secret-key');
+const newSecretValue = document.getElementById('new-secret-value');
+const addSecretBtn = document.getElementById('add-secret-btn');
+const exportSecretsBtn = document.getElementById('export-secrets-btn');
+const previewLabel = document.getElementById('preview-label');
+const viewCanvas = document.getElementById('view-canvas');
+const previewStatus = document.getElementById('preview-status');
+const toast = document.getElementById('toast');
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Toast
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let toastTimer = null;
+function showToast(msg, kind = '') {
+  toast.textContent = msg;
+  toast.className = kind ? `is-${kind}` : '';
+  toast.style.display = 'block';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.style.display = 'none'; }, 3500);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Transition selects
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function fillTransitionSelect(sel, selected = '') {
+  sel.replaceChildren();
+  for (const val of ['', ...TRANSITION_OPTIONS]) {
+    const opt = document.createElement('option');
+    opt.value = val;
+    opt.textContent = val || 'Inherit / none';
+    if (val === selected) opt.selected = true;
+    sel.append(opt);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Status polling
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function pollStatus() {
+  try {
+    const s = await apiGet('/api/status');
+    const slide = s.current_slide ?? '—';
+    const fps = s.fps > 0 ? `${s.fps.toFixed(1)} fps` : '';
+    statusBadge.textContent = fps ? `${slide} • ${fps}` : slide;
+  } catch {
+    statusBadge.textContent = 'display offline';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Playlist load / render
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function loadPlaylist() {
+  try {
+    const raw = await apiGet('/api/playlist');
+    state.editablePlaylist = toEditablePlaylist(raw);
+    state.savedJson = JSON.stringify(serializeEditablePlaylist(state.editablePlaylist));
+    renderEditor();
+    await hydrateAllManifests();
+  } catch (e) {
+    showToast(`Failed to load playlist: ${e.message}`, 'error');
+  }
+}
+
+function renderEditor() {
+  if (!state.editablePlaylist) return;
+  const ep = state.editablePlaylist;
+  defaultDuration.value = ep.defaults.duration_seconds;
+  displayScale.value = ep.display_scale;
+  fillTransitionSelect(defaultTransitionIn, ep.defaults.transition_in);
+  fillTransitionSelect(defaultTransitionOut, ep.defaults.transition_out);
+  renderEntries();
+  updateSaveButton();
+}
+
+function updateSaveButton() {
+  if (!state.editablePlaylist) { saveBtn.disabled = true; return; }
+  try {
+    const current = JSON.stringify(serializeEditablePlaylist(state.editablePlaylist));
+    saveBtn.disabled = false;
+    saveBtn.textContent = current !== state.savedJson ? 'Save playlist *' : 'Save playlist';
+  } catch {
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Save playlist';
+  }
+}
+
+function escHtml(v) {
+  return String(v ?? '')
+    .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function createNote(text, tone = '') {
+  const p = document.createElement('p');
+  p.className = `field-note${tone ? ` is-${tone}` : ''}`;
+  p.textContent = text;
+  return p;
+}
+
+function describeInherited(entry, key) {
+  const own = entry[key];
+  const def = state.editablePlaylist?.defaults?.[key] ?? '';
+  const bun = entry.bundle_manifest?.display?.[key] ?? null;
+  if (own) return `Override. Playlist default: ${def || 'none'}.`;
+  if (def) return `Inherited from defaults: ${def}.`;
+  if (bun) return `Bundle default: ${bun}.`;
+  return 'No default set.';
+}
+
+function buildManifestBadges(entry) {
+  const m = entry.bundle_manifest;
+  const badges = [];
+  if (entry.bundle_manifest_status === 'loading') badges.push('loading…');
+  if (entry.bundle_manifest_status === 'error') badges.push('metadata unavailable');
+  if (!m) return badges;
+  if (m.author) badges.push(`by ${m.author}`);
+  if (m.scene_space) badges.push(m.scene_space);
+  if (m.display?.duration_seconds != null) badges.push(`${m.display.duration_seconds}s`);
+  if (m.params?.fields?.length) badges.push(`${m.params.fields.length} params`);
+  return badges;
+}
+
+function renderEntries() {
+  entryList.replaceChildren();
+  if (!state.editablePlaylist) return;
+
+  for (const [idx, entry] of state.editablePlaylist.slides.entries()) {
+    const card = document.createElement('section');
+    card.className = `editor-entry${state.selectedIndex === idx ? ' is-selected' : ''}`;
+    card.dataset.index = String(idx);
+
+    // Top line
+    const topLine = document.createElement('div');
+    topLine.className = 'entry-topline';
+    const indexLabel = document.createElement('span');
+    indexLabel.className = 'entry-index';
+    indexLabel.textContent = `Slide ${idx + 1}`;
+    const actions = document.createElement('div');
+    actions.className = 'entry-actions';
+
+    const previewBtn = document.createElement('button');
+    previewBtn.className = 'secondary-btn';
+    previewBtn.dataset.action = 'preview';
+    previewBtn.textContent = 'Preview';
+
+    const upBtn = document.createElement('button');
+    upBtn.className = 'icon-btn'; upBtn.dataset.action = 'move-up';
+    upBtn.textContent = '↑'; upBtn.disabled = idx === 0;
+
+    const downBtn = document.createElement('button');
+    downBtn.className = 'icon-btn'; downBtn.dataset.action = 'move-down';
+    downBtn.textContent = '↓';
+    downBtn.disabled = idx === state.editablePlaylist.slides.length - 1;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'icon-btn danger-btn'; removeBtn.dataset.action = 'remove';
+    removeBtn.textContent = '✕';
+
+    actions.append(previewBtn, upBtn, downBtn, removeBtn);
+    topLine.append(indexLabel, actions);
+
+    // Summary
+    const summary = document.createElement('div');
+    summary.className = 'entry-summary';
+    const title = document.createElement('div');
+    title.className = 'entry-summary-title';
+    title.textContent = entry.bundle_manifest?.name ?? entry.path || 'New slide';
+    summary.append(title);
+    const badges = buildManifestBadges(entry);
+    if (badges.length) {
+      const row = document.createElement('div');
+      row.className = 'badge-row';
+      for (const b of badges) {
+        const pill = document.createElement('span');
+        pill.className = 'badge-pill'; pill.textContent = b;
+        row.append(pill);
+      }
+      summary.append(row);
+    }
+    if (entry.bundle_manifest_status === 'error')
+      summary.append(createNote(`Metadata unavailable: ${entry.bundle_error}`, 'error'));
+
+    // Fields grid
+    const grid = document.createElement('div');
+    grid.className = 'form-grid';
+
+    const pathField = document.createElement('label');
+    pathField.className = 'field is-wide';
+    pathField.innerHTML = `<span>Bundle path</span>
+      <input data-field="path" value="${escHtml(entry.path)}" placeholder="clock.vzglyd" />`;
+    pathField.append(createNote('Path relative to the slides directory.'));
+
+    const enabledField = document.createElement('label');
+    enabledField.className = 'field';
+    enabledField.innerHTML = `<span>Enabled</span>
+      <select data-field="enabled">
+        <option value="true"${entry.enabled !== false ? ' selected' : ''}>true</option>
+        <option value="false"${entry.enabled === false ? ' selected' : ''}>false</option>
+      </select>`;
+
+    const durField = document.createElement('label');
+    durField.className = 'field';
+    durField.innerHTML = `<span>Duration (s)</span>
+      <input data-field="duration_seconds" type="number" min="1" max="300"
+        value="${escHtml(entry.duration_seconds)}" placeholder="inherit" />`;
+    durField.append(createNote(describeInherited(entry, 'duration_seconds')));
+
+    const tiField = document.createElement('label');
+    tiField.className = 'field';
+    tiField.innerHTML = '<span>Transition in</span>';
+    const tiSel = document.createElement('select');
+    tiSel.dataset.field = 'transition_in';
+    fillTransitionSelect(tiSel, entry.transition_in);
+    tiField.append(tiSel, createNote(describeInherited(entry, 'transition_in')));
+
+    const toField = document.createElement('label');
+    toField.className = 'field';
+    toField.innerHTML = '<span>Transition out</span>';
+    const toSel = document.createElement('select');
+    toSel.dataset.field = 'transition_out';
+    fillTransitionSelect(toSel, entry.transition_out);
+    toField.append(toSel, createNote(describeInherited(entry, 'transition_out')));
+
+    grid.append(pathField, enabledField, durField, tiField, toField);
+
+    // Params
+    const paramsShell = document.createElement('div');
+    paramsShell.className = 'entry-params-shell';
+    const paramsLabel = document.createElement('label');
+    paramsLabel.className = 'field is-wide';
+    paramsLabel.innerHTML = '<span>Params JSON</span>';
+    const paramsArea = document.createElement('textarea');
+    paramsArea.dataset.field = 'params_text';
+    paramsArea.placeholder = '{\n  "key": "value"\n}';
+    paramsArea.value = entry.params_text;
+    paramsLabel.append(paramsArea);
+    paramsShell.append(paramsLabel);
+
+    card.append(topLine, summary, grid, paramsShell);
+    entryList.append(card);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Manifest hydration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function hydrateManifest(entry) {
+  const path = entry.path?.trim();
+  if (!path) return;
+  entry.bundle_manifest_status = 'loading';
+  try {
+    const m = await apiGet(`/api/slides/${encodeURIComponent(path)}/manifest`);
+    entry.bundle_manifest = m;
+    entry.bundle_manifest_status = 'ready';
+    entry.bundle_error = '';
+  } catch (e) {
+    entry.bundle_manifest = null;
+    entry.bundle_manifest_status = 'error';
+    entry.bundle_error = e.message;
+  }
+}
+
+async function hydrateAllManifests() {
+  if (!state.editablePlaylist) return;
+  const entries = state.editablePlaylist.slides.filter(e => e.path?.trim());
+  await Promise.all(entries.map(e => hydrateManifest(e)));
+  renderEditor();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Save playlist
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function savePlaylist() {
+  try {
+    const serialized = serializeEditablePlaylist(state.editablePlaylist);
+    const json = JSON.stringify(serialized, null, 2) + '\n';
+    await apiPostRaw('/api/playlist', json);
+    state.savedJson = JSON.stringify(serialized);
+    updateSaveButton();
+    showToast('Playlist saved and applied to display.', 'success');
+  } catch (e) {
+    showToast(`Save failed: ${e.message}`, 'error');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Slide library
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function loadLibrary() {
+  try {
+    state.library = await apiGet('/api/slides');
+    renderLibrary();
+  } catch (e) {
+    showToast(`Failed to load slide library: ${e.message}`, 'error');
+  }
+}
+
+function renderLibrary() {
+  libraryList.replaceChildren();
+  if (!state.library.length) {
+    libraryList.append(createNote('No .vzglyd files found in slides directory.'));
+    return;
+  }
+  for (const bundle of state.library) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:0.5rem;padding:0.35rem 0;border-bottom:1px solid var(--border)';
+
+    const info = document.createElement('div');
+    const name = document.createElement('span');
+    name.style.fontWeight = '600';
+    name.textContent = bundle.manifest?.name ?? bundle.path;
+    const meta = document.createElement('span');
+    meta.style.cssText = 'font-size:0.78rem;color:var(--text-dim);margin-left:0.5rem';
+    meta.textContent = bundle.path;
+    info.append(name, meta);
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'secondary-btn';
+    addBtn.textContent = '+ Add';
+    addBtn.style.flexShrink = '0';
+    addBtn.addEventListener('click', () => {
+      if (!state.editablePlaylist) return;
+      const entry = emptyEditableEntry();
+      entry.path = bundle.path;
+      entry.bundle_manifest = bundle.manifest;
+      entry.bundle_manifest_status = bundle.manifest ? 'ready' : 'idle';
+      state.editablePlaylist.slides.push(entry);
+      renderEditor();
+      showToast(`Added ${bundle.path} to playlist.`);
+    });
+
+    row.append(info, addBtn);
+    libraryList.append(row);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Upload
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function uploadFiles(files) {
+  for (const file of files) {
+    if (!file.name.endsWith('.vzglyd')) {
+      showToast(`${file.name}: not a .vzglyd file`, 'error');
+      continue;
+    }
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+    try {
+      const r = await fetch('/api/slides/upload', { method: 'POST', body: formData });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || r.statusText);
+      }
+      showToast(`Uploaded ${file.name}`, 'success');
+    } catch (e) {
+      showToast(`Upload failed: ${e.message}`, 'error');
+    }
+  }
+  await loadLibrary();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Secrets
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function loadSecrets() {
+  try {
+    const s = await apiGet('/api/secrets');
+    state.secretKeys = s.keys ?? [];
+    renderSecrets();
+  } catch (e) {
+    showToast(`Failed to load secrets: ${e.message}`, 'error');
+  }
+}
+
+function renderSecrets() {
+  secretsList.replaceChildren();
+  if (!state.secretKeys.length) {
+    secretsList.append(createNote('No secrets configured.'));
+    return;
+  }
+  const row = document.createElement('div');
+  for (const key of state.secretKeys) {
+    const badge = document.createElement('span');
+    badge.className = 'secret-key-badge';
+    badge.textContent = key;
+    row.append(badge);
+  }
+  secretsList.append(row);
+}
+
+async function addSecret() {
+  const key = newSecretKey.value.trim();
+  const val = newSecretValue.value;
+  if (!key || !val) { showToast('Both key and value are required.', 'error'); return; }
+  try {
+    await apiPost('/api/secrets', { [key]: val });
+    newSecretKey.value = '';
+    newSecretValue.value = '';
+    await loadSecrets();
+    showToast(`Secret '${key}' saved.`, 'success');
+  } catch (e) {
+    showToast(`Failed to save secret: ${e.message}`, 'error');
+  }
+}
+
+function exportSecrets() {
+  const a = document.createElement('a');
+  a.href = '/api/secrets/export';
+  a.download = 'secrets.json';
+  a.click();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WebGPU Preview
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let vzglydWebModule = null;
+
+async function loadVzglydWebModule() {
+  if (vzglydWebModule) return vzglydWebModule;
+  try {
+    // vzglyd_web.js uses global `import.meta` — load it as a module script.
+    // The bg wasm is fetched by the JS glue from /assets/pkg/vzglyd_web_bg.wasm.
+    vzglydWebModule = await import('/assets/pkg/vzglyd_web.js');
+    await vzglydWebModule.default();  // initialises the WASM module
+    return vzglydWebModule;
+  } catch (e) {
+    throw new Error(`Failed to load preview player: ${e.message}`);
+  }
+}
+
+async function previewSlide(index) {
+  state.selectedIndex = index;
+  renderEntries();
+
+  const entry = state.editablePlaylist?.slides?.[index];
+  if (!entry?.path) return;
+
+  previewLabel.textContent = `Preview: ${entry.bundle_manifest?.name ?? entry.path}`;
+  previewStatus.textContent = 'Loading…';
+
+  if (state.previewHost) {
+    state.previewHost.teardown();
+    state.previewHost = null;
+  }
+
+  try {
+    // Check WebGPU availability.
+    if (!navigator.gpu) {
+      previewStatus.textContent = 'WebGPU not available in this browser.';
+      return;
+    }
+
+    const mod = await loadVzglydWebModule();
+    const host = new mod.WebHost(viewCanvas, null);
+    state.previewHost = host;
+
+    // Fetch the bundle bytes.
+    const resp = await fetch(`/api/slides/${encodeURIComponent(entry.path)}/bundle`);
+    if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+
+    // Parse params.
+    let paramsJson = null;
+    try { paramsJson = parseParamsText(entry.params_text); } catch { /* ignore */ }
+
+    await host.loadBundle(bytes, paramsJson ? { params: paramsJson } : null);
+    previewStatus.textContent = '';
+
+    // Frame loop.
+    let rafId = null;
+    function tick(ts) {
+      if (!state.previewHost || state.previewHost !== host) return;
+      try { host.frame(ts); } catch { return; }
+      rafId = requestAnimationFrame(tick);
+    }
+    rafId = requestAnimationFrame(tick);
+
+    // Clean up on next preview.
+    const origTeardown = host.teardown.bind(host);
+    host.teardown = () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      origTeardown();
+    };
+  } catch (e) {
+    previewStatus.textContent = `Preview error: ${e.message}`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Event wiring
+// ═══════════════════════════════════════════════════════════════════════════════
+
+saveBtn.addEventListener('click', () => void savePlaylist());
+
+addEntryBtn.addEventListener('click', () => {
+  if (!state.editablePlaylist) return;
+  state.editablePlaylist.slides.push(emptyEditableEntry());
+  renderEditor();
+});
+
+defaultDuration.addEventListener('input', () => {
+  if (!state.editablePlaylist) return;
+  state.editablePlaylist.defaults.duration_seconds = defaultDuration.value;
+  updateSaveButton();
+});
+
+displayScale.addEventListener('input', () => {
+  if (!state.editablePlaylist) return;
+  state.editablePlaylist.display_scale = displayScale.value;
+  updateSaveButton();
+});
+
+defaultTransitionIn.addEventListener('change', () => {
+  if (!state.editablePlaylist) return;
+  state.editablePlaylist.defaults.transition_in = defaultTransitionIn.value;
+  renderEditor();
+});
+
+defaultTransitionOut.addEventListener('change', () => {
+  if (!state.editablePlaylist) return;
+  state.editablePlaylist.defaults.transition_out = defaultTransitionOut.value;
+  renderEditor();
+});
+
+entryList.addEventListener('input', e => {
+  const card = e.target.closest('.editor-entry');
+  if (!card) return;
+  const idx = +card.dataset.index;
+  const entry = state.editablePlaylist?.slides?.[idx];
+  if (!entry) return;
+  const field = e.target.dataset.field;
+  if (field === 'enabled') entry.enabled = e.target.value !== 'false';
+  else if (field) entry[field] = e.target.value;
+  updateSaveButton();
+});
+
+entryList.addEventListener('change', e => {
+  const card = e.target.closest('.editor-entry');
+  if (!card) return;
+  const idx = +card.dataset.index;
+  const entry = state.editablePlaylist?.slides?.[idx];
+  if (!entry) return;
+  const field = e.target.dataset.field;
+  if (field === 'enabled') entry.enabled = e.target.value !== 'false';
+  else if (field) entry[field] = e.target.value;
+  if (field === 'path') {
+    void hydrateManifest(entry).then(() => renderEntries());
+  }
+  updateSaveButton();
+});
+
+entryList.addEventListener('click', e => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const card = btn.closest('.editor-entry');
+  const idx = +card.dataset.index;
+  const slides = state.editablePlaylist?.slides;
+  if (!slides) return;
+
+  switch (btn.dataset.action) {
+    case 'preview': void previewSlide(idx); break;
+    case 'move-up':
+      if (idx > 0) { [slides[idx-1], slides[idx]] = [slides[idx], slides[idx-1]]; renderEditor(); }
+      break;
+    case 'move-down':
+      if (idx < slides.length-1) { [slides[idx], slides[idx+1]] = [slides[idx+1], slides[idx]]; renderEditor(); }
+      break;
+    case 'remove':
+      slides.splice(idx, 1);
+      if (state.selectedIndex === idx) state.selectedIndex = null;
+      renderEditor();
+      break;
+  }
+});
+
+refreshLibraryBtn.addEventListener('click', () => void loadLibrary());
+
+dropZone.addEventListener('click', () => uploadInput.click());
+uploadInput.addEventListener('change', () => {
+  if (uploadInput.files?.length) void uploadFiles([...uploadInput.files]);
+  uploadInput.value = '';
+});
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('is-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('is-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('is-over');
+  if (e.dataTransfer?.files?.length) void uploadFiles([...e.dataTransfer.files]);
+});
+
+addSecretBtn.addEventListener('click', () => void addSecret());
+newSecretValue.addEventListener('keydown', e => { if (e.key === 'Enter') void addSecret(); });
+exportSecretsBtn.addEventListener('click', exportSecrets);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function boot() {
+  fillTransitionSelect(defaultTransitionIn);
+  fillTransitionSelect(defaultTransitionOut);
+  await Promise.all([loadPlaylist(), loadLibrary(), loadSecrets()]);
+  setInterval(() => void pollStatus(), 2000);
+  void pollStatus();
+}
+
+void boot();
+</script>
+</body>
+</html>

@@ -800,7 +800,7 @@ fn load_sidecar(
     wasm_bytes: &[u8],
     tx: SlideChannel,
 ) -> Result<SidecarHandle, LoadError> {
-    load_sidecar_with_config(engine, wasm_bytes, tx, &[], "test-sidecar", None)
+    load_sidecar_with_config(engine, wasm_bytes, tx, &[], "test-sidecar", None, &[])
 }
 
 fn load_sidecar_with_config(
@@ -810,6 +810,7 @@ fn load_sidecar_with_config(
     wasi_preopens: &[String],
     runtime_label: &str,
     params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
 ) -> Result<SidecarHandle, LoadError> {
     load_sidecar_with_executor(
         engine,
@@ -819,6 +820,7 @@ fn load_sidecar_with_config(
         runtime_label,
         params_bytes,
         default_sidecar_request_executor(),
+        extra_env,
     )
 }
 
@@ -830,6 +832,7 @@ fn load_sidecar_with_executor(
     runtime_label: &str,
     params_bytes: Option<&[u8]>,
     request_executor: SidecarRequestExecutor,
+    extra_env: &[(String, String)],
 ) -> Result<SidecarHandle, LoadError> {
     let module =
         Module::new(engine, wasm_bytes).map_err(|error| LoadError::WasmLoad(error.to_string()))?;
@@ -837,6 +840,7 @@ fn load_sidecar_with_executor(
     let wasi_preopens = wasi_preopens.to_vec();
     let runtime_label = runtime_label.to_string();
     let params_bytes = params_bytes.map(|bytes| bytes.to_vec());
+    let extra_env = extra_env.to_vec();
     log::info!(
         "sidecar:{} spawning (preopens={})",
         runtime_label,
@@ -854,6 +858,7 @@ fn load_sidecar_with_executor(
                 &runtime_label,
                 params_bytes.as_deref(),
                 request_executor,
+                &extra_env,
             );
             #[cfg(test)]
             if let Err(error) = result {
@@ -879,12 +884,18 @@ fn run_sidecar_module(
     runtime_label: &str,
     params_bytes: Option<&[u8]>,
     request_executor: SidecarRequestExecutor,
+    extra_env: &[(String, String)],
 ) -> Result<(), LoadError> {
     let mut wasi_builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
     wasi_builder.inherit_stdout().inherit_stderr();
     wasi_builder
         .inherit_env()
         .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    for (key, val) in extra_env {
+        wasi_builder
+            .env(key, val)
+            .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    }
     configure_sidecar_preopens(&mut wasi_builder, wasi_preopens)?;
     let wasi = wasi_builder.build();
     let mut store = Store::new(
@@ -2236,6 +2247,7 @@ where
 pub fn load_slide_from_wasm<V>(
     wasm_path: &str,
     params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
 ) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
 where
     V: PackageMeshVertex,
@@ -2326,6 +2338,7 @@ where
             &sidecar_preopens,
             &sidecar_runtime_label,
             params_bytes,
+            extra_env,
         )?;
         if let Some(runtime) = loaded.runtime.as_mut() {
             runtime.attach_sidecar(sidecar);
@@ -2344,6 +2357,7 @@ where
 pub fn load_slide_from_archive<V>(
     archive_path: &str,
     params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
 ) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
 where
     V: PackageMeshVertex,
@@ -2353,7 +2367,7 @@ where
             "'{archive_path}' is not a .{PACKAGE_ARCHIVE_EXTENSION} archive"
         )));
     }
-    load_slide_from_wasm(archive_path, params_bytes)
+    load_slide_from_wasm(archive_path, params_bytes, extra_env)
 }
 
 pub fn pack_slide_directory(
@@ -4526,7 +4540,7 @@ mod tests {
         );
 
         let (loaded, _) =
-            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load compiled scene package");
         let spec = loaded.spec;
 
@@ -4605,7 +4619,7 @@ mod tests {
         );
 
         let (loaded, _) =
-            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load compiled scene package");
         let lighting = loaded.spec.lighting.expect("compiled scene lighting");
         let directional = lighting
@@ -4654,7 +4668,7 @@ mod tests {
         );
 
         let (loaded, _) =
-            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load compiled scene package");
         let error = loaded
             .spec
@@ -4701,7 +4715,7 @@ mod tests {
         write_package_root(&package_dir, manifest, &wasm);
 
         let (loaded, _) =
-            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load package with targeted mesh overrides");
         let spec = loaded.spec;
 
@@ -4758,7 +4772,7 @@ mod tests {
         );
 
         let (mut loaded, _) =
-            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load package with runtime mesh asset");
 
         assert_eq!(
@@ -4938,10 +4952,10 @@ cp built/slide.wasm slide.wasm
         assert!(names.iter().any(|name| name == "assets/kart.glb"));
 
         let (dir_loaded, _) =
-            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None)
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load directory package");
         let (archive_loaded, _) =
-            load_slide_from_archive::<WorldVertex>(archive_path.to_string_lossy().as_ref(), None)
+            load_slide_from_archive::<WorldVertex>(archive_path.to_string_lossy().as_ref(), None, &[])
                 .expect("load archive package");
 
         assert_eq!(
@@ -4968,6 +4982,7 @@ cp built/slide.wasm slide.wasm
         let error = match load_slide_from_archive::<WorldVertex>(
             archive_path.to_string_lossy().as_ref(),
             None,
+            &[],
         ) {
             Ok(_) => panic!("unsafe archive path should fail"),
             Err(error) => error,
