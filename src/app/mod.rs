@@ -568,7 +568,7 @@ impl NativeApp {
                     let bg = ctx.create_blit_bind_group(o);
                     if let Some(overlay) = self.overlay_renderer.as_mut() {
                         ctx.blit_and_overlay_to_surface(o, &bg, |view, encoder| {
-                            overlay.record_pass(ctx, view, encoder, slide_name.as_deref());
+                            overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_blit_rect());
                         })
                     } else {
                         ctx.blit_to_surface(o, &bg)
@@ -592,7 +592,7 @@ impl NativeApp {
                         let bg = ctx.create_blit_bind_group(o);
                         if let Some(overlay) = self.overlay_renderer.as_mut() {
                             ctx.blit_and_overlay_to_surface(o, &bg, |view, encoder| {
-                                overlay.record_pass(ctx, view, encoder, slide_name.as_deref());
+                                overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_blit_rect());
                             })
                         } else {
                             ctx.blit_to_surface(o, &bg)
@@ -614,7 +614,7 @@ impl NativeApp {
                     let bg = ctx.create_blit_bind_group(comp);
                     if let Some(overlay) = self.overlay_renderer.as_mut() {
                         ctx.blit_and_overlay_to_surface(comp, &bg, |view, encoder| {
-                            overlay.record_pass(ctx, view, encoder, slide_name.as_deref());
+                            overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_blit_rect());
                         })
                     } else {
                         ctx.blit_to_surface(comp, &bg)
@@ -629,7 +629,7 @@ impl NativeApp {
                         let bg = ctx.create_blit_bind_group(o);
                         if let Some(overlay) = self.overlay_renderer.as_mut() {
                             ctx.blit_and_overlay_to_surface(o, &bg, |view, encoder| {
-                                overlay.record_pass(ctx, view, encoder, slide_name.as_deref());
+                                overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_blit_rect());
                             })
                         } else {
                             ctx.blit_to_surface(o, &bg)

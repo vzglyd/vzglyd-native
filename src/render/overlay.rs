@@ -218,6 +218,10 @@ impl OverlayRenderer {
 
     /// Records the overlay render pass into `encoder`, targeting `view`.
     ///
+    /// `blit_rect` is `(x, y, width, height)` in surface pixels — the letterbox
+    /// rect the slide was blitted into. The overlay is constrained to that rect
+    /// so that the border and footer align with the slide edges, not the screen edges.
+    ///
     /// Must be called after the slide blit pass so that `LoadOp::Load` preserves
     /// the slide content underneath the overlay geometry.
     pub fn record_pass(
@@ -226,10 +230,10 @@ impl OverlayRenderer {
         view: &wgpu::TextureView,
         encoder: &mut wgpu::CommandEncoder,
         slide_name: Option<&str>,
+        blit_rect: (u32, u32, u32, u32),
     ) {
         let clock_str = Local::now().format("%H:%M:%S").to_string();
-        let sw = ctx.config.width;
-        let sh = ctx.config.height;
+        let (vp_x, vp_y, sw, sh) = blit_rect;
 
         let (vertices, indices): (Vec<OverlayVertex>, Vec<u16>) =
             build_hud_geometry(&self.glyph_map, sw, sh, slide_name, &clock_str);
@@ -275,7 +279,7 @@ impl OverlayRenderer {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
+        pass.set_viewport(vp_x as f32, vp_y as f32, sw as f32, sh as f32, 0.0, 1.0);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
