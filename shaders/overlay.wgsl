@@ -33,11 +33,11 @@ fn vs_main(v: OverlayVertex) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    if in.mode < 0.5 {
-        // Solid geometry — return the vertex colour directly.
-        return in.color;
-    }
-    // Font glyph — sample the red channel of the atlas as alpha.
-    let a = textureSample(font_tex, font_smp, in.uv).r;
-    return vec4<f32>(in.color.rgb, in.color.a * a);
+    // textureSample must be in uniform control flow, so we always sample and
+    // then blend: solid quads (mode < 0.5) use color.a directly, glyph quads
+    // use the atlas red channel as alpha.
+    let atlas_r = textureSample(font_tex, font_smp, in.uv).r;
+    let t = step(0.5, in.mode); // 0.0 for solid, 1.0 for glyph
+    let alpha = mix(in.color.a, in.color.a * atlas_r, t);
+    return vec4<f32>(in.color.rgb, alpha);
 }
