@@ -434,14 +434,7 @@ impl ScreenSlideRenderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &target.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
+                depth_stencil_attachment: None, // Screen2D: no depth testing needed
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
@@ -1515,17 +1508,10 @@ fn create_screen_slide_pipelines(
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
+                    cull_mode: None, // Screen2D: no culling needed
                     ..Default::default()
                 },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: crate::gpu::context::DEPTH_FORMAT,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
+                depth_stencil: None, // Screen2D: no depth; painter's order is index order
                 multisample: wgpu::MultisampleState {
                     count: 1,
                     mask: !0,
@@ -1559,16 +1545,10 @@ fn create_screen_slide_pipelines(
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None, // 2D quads always face the camera; culling not needed
+                    cull_mode: None, // Screen2D: no culling needed
                     ..Default::default()
                 },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: crate::gpu::context::DEPTH_FORMAT,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always, // 2D quads render unconditionally
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
+                depth_stencil: None, // Screen2D: no depth; painter's order is index order
                 multisample: wgpu::MultisampleState {
                     count: 1,
                     mask: !0,
