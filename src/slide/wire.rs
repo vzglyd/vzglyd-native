@@ -115,6 +115,8 @@ mod tests {
             dynamic_meshes: vec![],
             draws: vec![],
             lighting: None,
+            sounds: vec![],
+            animations: vec![],
         }
     }
 
@@ -133,6 +135,8 @@ mod tests {
             dynamic_meshes: vec![],
             draws: vec![],
             lighting: None,
+            sounds: vec![],
+            animations: vec![],
         }
     }
 

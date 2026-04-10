@@ -6,6 +6,21 @@
 //! - Concurrent sound playback
 //! - Error handling for invalid audio data
 //! - Sound catalog construction from manifest
+//!
+//! # Running on headless CI
+//!
+//! Tests that interact with audio hardware are marked `#[ignore]` so they do not
+//! fail on CI machines without an audio device. To run them, set up a virtual
+//! PulseAudio null sink first:
+//!
+//! ```bash
+//! pactl load-module module-null-sink sink_name=virtual0
+//! cargo test -p VRX-64-native --test audio_integration -- --ignored
+//! pactl unload-module module-null-sink
+//! ```
+//!
+//! Tests that do not call `AudioEngine::global()` or `SoundRegistry::play()` run
+//! unconditionally and do not require audio hardware.
 
 use std::fs;
 use std::path::PathBuf;
@@ -62,6 +77,7 @@ fn temp_test_dir(label: &str) -> PathBuf {
 // ── AudioEngine integration tests ─────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn engine_plays_valid_wav() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let wav = make_wav_bytes();
@@ -70,6 +86,7 @@ fn engine_plays_valid_wav() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn engine_rejects_synthetic_mp3_frame() {
     // A hand-crafted synthetic MP3 frame does not decode through rodio's
     // symphonia decoder because it lacks proper side-info structure.
@@ -86,6 +103,7 @@ fn engine_rejects_synthetic_mp3_frame() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn engine_rejects_garbage_data() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let garbage = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
@@ -97,6 +115,7 @@ fn engine_rejects_garbage_data() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn engine_rejects_empty_data() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let result = engine.play(&[], 0.5, false);
@@ -107,6 +126,7 @@ fn engine_rejects_empty_data() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn engine_plays_looped_sound() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let wav = make_wav_bytes();
@@ -116,6 +136,7 @@ fn engine_plays_looped_sound() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn engine_volume_set_at_play_time() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let wav = make_wav_bytes();
@@ -128,6 +149,7 @@ fn engine_volume_set_at_play_time() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn engine_concurrent_playback() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let wav = make_wav_bytes();
@@ -147,6 +169,7 @@ fn engine_concurrent_playback() {
 // ── SoundRegistry integration tests ──────────────────────────────────────────
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn registry_play_stop_lifecycle() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -159,6 +182,7 @@ fn registry_play_stop_lifecycle() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn registry_play_multiple_sounds() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -175,6 +199,7 @@ fn registry_play_multiple_sounds() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn registry_replaces_existing_sound() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -191,6 +216,7 @@ fn registry_replaces_existing_sound() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn registry_pause_resume_preserves_sound() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -205,6 +231,7 @@ fn registry_pause_resume_preserves_sound() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn registry_volume_change_on_playing_sound() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -231,6 +258,7 @@ fn registry_operations_on_nonexistent_ids() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn registry_full_lifecycle() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -259,6 +287,7 @@ fn registry_full_lifecycle() {
 // ── Sound catalog construction tests ─────────────────────────────────────────
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn catalog_loads_wav_from_disk() {
     let dir = temp_test_dir("catalog_wav");
     let wav = make_wav_bytes();
@@ -278,6 +307,7 @@ fn catalog_loads_wav_from_disk() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn catalog_rejects_synthetic_mp3_from_disk() {
     // A synthetic MP3 frame cannot be decoded by rodio's symphonia decoder.
     // This test confirms the engine rejects it cleanly.
@@ -311,6 +341,7 @@ fn catalog_handles_missing_file_gracefully() {
 // ── Stress/lifetime tests ────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn rapid_play_stop_cycles() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -324,6 +355,7 @@ fn rapid_play_stop_cycles() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn play_while_other_sounds_are_playing() {
     let mut registry = SoundRegistry::new();
     let wav = make_wav_bytes();
@@ -344,6 +376,7 @@ fn play_while_other_sounds_are_playing() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn stop_is_idempotent_on_sound_handle() {
     let engine = AudioEngine::global().expect("audio engine available");
     let wav = make_wav_bytes();
@@ -356,6 +389,7 @@ fn stop_is_idempotent_on_sound_handle() {
 }
 
 #[test]
+#[ignore = "requires audio hardware (ALSA/PulseAudio); see module doc for virtual sink setup"]
 fn drop_handle_does_not_panic() {
     let engine = AudioEngine::global().expect("audio engine available");
     let wav = make_wav_bytes();

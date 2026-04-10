@@ -1,8 +1,14 @@
 fn vs_main(in: VzglydVertexInput) -> VzglydVertexOutput {
     var out: VzglydVertexOutput;
-    out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
-    out.world_pos = in.position;
-    out.normal = in.normal;
+    let world_pos = (vzglyd_push.model_matrix * vec4<f32>(in.position, 1.0)).xyz;
+    out.clip_pos = u.view_proj * vec4<f32>(world_pos, 1.0);
+    out.world_pos = world_pos;
+    let normal_mat = mat3x3<f32>(
+        vzglyd_push.model_matrix[0].xyz,
+        vzglyd_push.model_matrix[1].xyz,
+        vzglyd_push.model_matrix[2].xyz,
+    );
+    out.normal = normalize(normal_mat * in.normal);
     out.color = in.color;
     out.mode = in.mode;
     return out;

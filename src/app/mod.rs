@@ -64,6 +64,8 @@ struct PendingSlide {
     package: LoadedSlidePackage,
 }
 
+type SlideLoadResult = Result<PendingSlide, (usize, String, String)>;
+
 struct LoadedSlidePackage {
     slide: LoadedSlide,
     manifest: Option<SlideManifest>,
@@ -98,7 +100,7 @@ pub struct NativeApp {
     composite_target: Option<OffscreenTarget>,
 
     /// Receives compiled slides from the background loader thread.
-    pending_rx: Option<Receiver<Result<PendingSlide, (usize, String, String)>>>,
+    pending_rx: Option<Receiver<SlideLoadResult>>,
     trace_recorder: Option<vzglyd_kernel::trace::TraceRecorder>,
     shutdown_requested: Arc<AtomicBool>,
     /// Secrets (API keys etc.) injected into sidecar WASI environments.
@@ -889,7 +891,7 @@ fn load_slide_package(
     idx: usize,
     slide: &ScheduledSlide,
     extra_env: &[(String, String)],
-) -> Result<PendingSlide, (usize, String, String)> {
+) -> SlideLoadResult {
     macro_rules! bail {
         ($msg:expr) => {
             return Err((idx, slide.path.clone(), $msg))

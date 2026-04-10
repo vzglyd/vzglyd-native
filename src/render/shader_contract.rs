@@ -72,6 +72,10 @@ struct VzglydUniforms {
     main_light_color: vec4<f32>,
 };
 
+struct VzglydPushConstants {
+    model_matrix: mat4x4<f32>,
+}
+
 @group(0) @binding(0) var<uniform> u: VzglydUniforms;
 @group(0) @binding(1) var t_font: texture_2d<f32>;
 @group(0) @binding(2) var t_noise: texture_2d<f32>;
@@ -79,6 +83,8 @@ struct VzglydUniforms {
 @group(0) @binding(4) var t_material_b: texture_2d<f32>;
 @group(0) @binding(5) var s_clamp: sampler;
 @group(0) @binding(6) var s_repeat: sampler;
+
+var<push_constant> vzglyd_push: VzglydPushConstants;
 
 fn vzglyd_ambient_light() -> vec3<f32> {
     return u.ambient_light.rgb;
@@ -145,6 +151,8 @@ fn vs_main(in: VzglydVertexInput) -> VzglydVertexOutput {
 }
 
 fn fs_main(in: VzglydVertexOutput) -> @location(0) vec4<f32> {
+    let normal = normalize(in.normal);
+    _ = vzglyd_push.model_matrix;
     return vec4<f32>(u.time, in.color.yzw);
 }
 "#,

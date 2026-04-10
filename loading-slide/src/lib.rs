@@ -20,6 +20,8 @@ fn loading_slide_spec() -> SlideSpec<WorldVertex> {
         font: None,
         textures_used: 0,
         textures: vec![],
+        sounds: vec![],
+        animations: vec![],
         static_meshes: vec![],
         dynamic_meshes: vec![],
         draws: vec![],
@@ -64,7 +66,7 @@ pub extern "C" fn vzglyd_spec_len() -> u32 {
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn vzglyd_abi_version() -> u32 {
-    1
+    3
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -21,10 +21,11 @@ use vzglyd_kernel::{
 };
 use vzglyd_sidecar::host_request;
 use vzglyd_slide::{
-    CameraKeyframe, CameraPath, DirectionalLight, DrawSource, DrawSpec, FilterMode, Limits,
-    MeshAsset, MeshAssetVertex, PipelineKind, RuntimeMeshSet, RuntimeOverlay, SceneAnchor,
-    SceneAnchorSet, SceneSpace, ScreenVertex, ShaderSources, SlideSpec, StaticMesh, TextureDesc,
-    TextureFormat, WorldLighting, WorldVertex, WrapMode, make_font_atlas,
+    AnimationChannel, AnimationClip, AnimationPath, CameraKeyframe, CameraPath, DirectionalLight,
+    DrawSource, DrawSpec, FilterMode, Limits, MeshAsset, MeshAssetVertex, PipelineKind,
+    RuntimeMeshSet, RuntimeOverlay, SceneAnchor, SceneAnchorSet, SceneSpace, ScreenVertex,
+    ShaderSources, SlideSpec, StaticMesh, TextureDesc, TextureFormat, WorldLighting, WorldVertex,
+    WrapMode, make_font_atlas,
 };
 use wasmtime::{Config, Engine, Instance, Memory, Module, Store, Trap, TypedFunc};
 use zip::write::SimpleFileOptions;
@@ -69,6 +70,14 @@ struct HostSoundCatalog {
     by_key: Arc<HashMap<String, Vec<u8>>>,
     /// Active sound instances managed through rodio
     registry: Arc<std::sync::Mutex<SoundRegistry>>,
+}
+
+impl std::fmt::Debug for HostSoundCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostSoundCatalog")
+            .field("sound_count", &self.by_key.len())
+            .finish_non_exhaustive()
+    }
 }
 
 struct SlideMailboxState {
@@ -308,6 +317,7 @@ impl PackReport {
 }
 
 impl SlideRuntime {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         store: Store<SlideStore>,
         instance: Instance,
@@ -834,6 +844,7 @@ fn load_sidecar_with_config(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_sidecar_with_executor(
     engine: &Engine,
     wasm_bytes: &[u8],
@@ -886,6 +897,7 @@ fn load_sidecar_with_executor(
     Ok(SidecarHandle { _thread: thread })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sidecar_module(
     engine: &Engine,
     module: &Module,
@@ -1514,7 +1526,7 @@ impl AssetLoader {
         })
     }
 
-    pub fn load_static_mesh<V: PackageMeshVertex>(
+    pub(crate) fn load_static_mesh<V: PackageMeshVertex>(
         &self,
         path: &str,
         template: &StaticMesh<V>,
@@ -1851,7 +1863,7 @@ fn ensure_compiled_scene_textures<V: bytemuck::Pod>(spec: &mut SlideSpec<V>) {
 }
 
 fn normalize_imported_directional_intensity(intensity: f32) -> f32 {
-    intensity.max(0.0).min(4.0)
+    intensity.clamp(0.0, 4.0)
 }
 
 fn compile_scene_lighting(
@@ -1977,7 +1989,60 @@ where
     spec.draws.extend(preserved_dynamic_draws);
     spec.lighting = compile_scene_lighting(scene, spec.lighting.as_ref());
     ensure_compiled_scene_textures(spec);
+    spec.animations = convert_scene_animations(scene, &visible_mesh_nodes);
     Ok(())
+}
+
+/// Convert imported GLB animation clips into slide ABI `AnimationClip` types.
+///
+/// Maps node indices to mesh labels using the visible mesh node list.
+/// Channels targeting nodes that aren't in the visible mesh list are skipped.
+fn convert_scene_animations(
+    scene: &ImportedScene,
+    visible_mesh_nodes: &[&ImportedSceneMeshNode],
+) -> Vec<AnimationClip> {
+    // Build a mapping from node_index → mesh label
+    let node_label_map: std::collections::HashMap<usize, &str> = visible_mesh_nodes
+        .iter()
+        .map(|node| (node.node_index, node.label.as_str()))
+        .collect();
+
+    scene
+        .animations
+        .iter()
+        .filter_map(|imported_clip| {
+            let mut channels = Vec::new();
+            for imported_channel in &imported_clip.channels {
+                let Some(&label) = node_label_map.get(&imported_channel.node_index) else {
+                    continue; // skip channels for non-mesh nodes
+                };
+
+                let path = match imported_channel.path {
+                    vzglyd_kernel::AnimationPath::Translation => AnimationPath::Translation,
+                    vzglyd_kernel::AnimationPath::Rotation => AnimationPath::Rotation,
+                    vzglyd_kernel::AnimationPath::Scale => AnimationPath::Scale,
+                };
+
+                channels.push(AnimationChannel {
+                    node_label: label.to_owned(),
+                    path,
+                    keyframe_times: imported_channel.keyframe_times.clone(),
+                    keyframe_values: imported_channel.keyframe_values.clone(),
+                });
+            }
+
+            if channels.is_empty() {
+                return None;
+            }
+
+            Some(AnimationClip {
+                name: imported_clip.name.clone(),
+                duration: imported_clip.duration,
+                looped: true, // default to looped for GLB animations
+                channels,
+            })
+        })
+        .collect()
 }
 
 fn maybe_compile_authored_scene<V>(
@@ -2037,6 +2102,7 @@ fn empty_world_scene_spec() -> SlideSpec<WorldVertex> {
         textures_used: 0,
         textures: vec![],
         sounds: vec![],
+        animations: vec![],
         static_meshes: vec![],
         dynamic_meshes: vec![],
         draws: vec![],
@@ -2274,7 +2340,7 @@ pub fn make_spec_wasm_bytes(spec_bytes: &[u8]) -> Vec<u8> {
         "(module\n\
            (memory (export \"memory\") {pages})\n\
            (data (i32.const 0) \"{escaped}\")\n\
-           (func (export \"vzglyd_abi_version\") (result i32) i32.const 1)\n\
+           (func (export \"vzglyd_abi_version\") (result i32) i32.const 3)\n\
            (func (export \"vzglyd_spec_ptr\") (result i32) i32.const 0)\n\
            (func (export \"vzglyd_spec_len\") (result i32) i32.const {len})\n\
            (func (export \"vzglyd_init\") (result i32) i32.const 0)\n\
@@ -2309,7 +2375,7 @@ where
     Ok(loaded)
 }
 
-pub fn load_slide_from_wasm<V>(
+pub(crate) fn load_slide_from_wasm<V>(
     wasm_path: &str,
     params_bytes: Option<&[u8]>,
     extra_env: &[(String, String)],
@@ -2421,7 +2487,7 @@ where
     Ok((loaded, manifest))
 }
 
-pub fn load_slide_from_archive<V>(
+pub(crate) fn load_slide_from_archive<V>(
     archive_path: &str,
     params_bytes: Option<&[u8]>,
     extra_env: &[(String, String)],
@@ -2923,7 +2989,6 @@ pub(crate) fn load_manifest(manifest_path: &Path) -> Result<SlideManifest, LoadE
         .map_err(|_| LoadError::MissingManifest(manifest_path.clone()))?;
     let manifest: SlideManifest =
         serde_json::from_str(&manifest_str).map_err(|e| LoadError::ManifestParse(e.to_string()))?;
-    let package_root = manifest_path_buf.parent().unwrap_or_else(|| Path::new("."));
     manifest
         .validate(vzglyd_slide::ABI_VERSION)
         .map_err(|e| LoadError::ManifestValidation(e.to_string()))?;
@@ -3437,7 +3502,7 @@ where
             Err(e) => {
                 let clean = e
                     .downcast_ref::<wasmtime_wasi::I32Exit>()
-                    .map_or(false, |exit: &wasmtime_wasi::I32Exit| exit.0 == 0);
+                    .is_some_and(|exit: &wasmtime_wasi::I32Exit| exit.0 == 0);
                 if !clean {
                     return Err(LoadError::WasmLoad(format!("_start failed: {e}")));
                 }
@@ -3460,7 +3525,7 @@ fn extract_spec<V>(
 where
     V: PackageMeshVertex,
 {
-    let spec = decode_spec(&mut store, instance.clone(), params_bytes)?;
+    let spec = decode_spec(&mut store, instance, params_bytes)?;
     log::info!("slide:{} decoded immutable spec", store.data().label);
     let memory = instance
         .get_memory(&mut store, "memory")
@@ -3733,6 +3798,7 @@ mod tests {
             textures_used: 0,
             textures: vec![],
             sounds: vec![],
+            animations: vec![],
             static_meshes: vec![],
             dynamic_meshes: vec![],
             draws: vec![],
@@ -3779,6 +3845,7 @@ mod tests {
             textures_used: 0,
             textures: vec![],
             sounds: vec![],
+            animations: vec![],
             static_meshes: vec![mesh0.clone(), mesh1.clone()],
             dynamic_meshes: vec![],
             draws: vec![
@@ -4138,7 +4205,7 @@ mod tests {
             "(module\n\
                (memory (export \"memory\") {pages})\n\
                (data (i32.const 0) \"{escaped}\")\n\
-               (func (export \"vzglyd_abi_version\") (result i32) i32.const 1)\n\
+               (func (export \"vzglyd_abi_version\") (result i32) i32.const 3)\n\
                (func (export \"vzglyd_spec_ptr\") (result i32) i32.const 0)\n\
                (func (export \"vzglyd_spec_len\") (result i32) i32.const {len})\n\
                (func (export \"vzglyd_init\") (result i32) i32.const 0)\n\
@@ -4163,7 +4230,7 @@ mod tests {
             "(module\n\
                (memory (export \"memory\") {pages})\n\
                (data (i32.const 0) \"{escaped}\")\n\
-               (func (export \"vzglyd_abi_version\") (result i32) i32.const 1)\n\
+               (func (export \"vzglyd_abi_version\") (result i32) i32.const 3)\n\
                (func (export \"vzglyd_spec_ptr\") (result i32) i32.const 0)\n\
                (func (export \"vzglyd_spec_len\") (result i32) i32.const {len})\n\
                (func (export \"vzglyd_init\") (result i32) i32.const 0)\n\
@@ -4198,7 +4265,7 @@ mod tests {
                (memory (export \"memory\") {pages})\n\
                (data (i32.const {key_offset}) \"{escaped_key}\")\n\
                (data (i32.const {spec_offset}) \"{escaped_spec}\")\n\
-               (func (export \"vzglyd_abi_version\") (result i32) i32.const 1)\n\
+               (func (export \"vzglyd_abi_version\") (result i32) i32.const 3)\n\
                (func (export \"vzglyd_spec_ptr\") (result i32) i32.const {spec_offset})\n\
                (func (export \"vzglyd_spec_len\") (result i32) i32.const {len})\n\
                (func (export \"vzglyd_init\") (result i32)\n\
@@ -4243,7 +4310,7 @@ mod tests {
                (import \"vzglyd_host\" \"channel_poll\" (func $channel_poll (param i32 i32) (result i32)))\n\
                (memory (export \"memory\") {pages})\n\
                (data (i32.const {spec_offset}) \"{escaped_spec}\")\n\
-               (func (export \"vzglyd_abi_version\") (result i32) i32.const 1)\n\
+               (func (export \"vzglyd_abi_version\") (result i32) i32.const 3)\n\
                (func (export \"vzglyd_spec_ptr\") (result i32) i32.const {spec_offset})\n\
                (func (export \"vzglyd_spec_len\") (result i32) i32.const {len})\n\
                (func (export \"vzglyd_init\") (result i32)\n\
@@ -4278,7 +4345,7 @@ mod tests {
                (import \"vzglyd_host\" \"channel_poll\" (func $channel_poll (param i32 i32) (result i32)))\n\
                (memory (export \"memory\") {pages})\n\
                (data (i32.const {spec_offset}) \"{escaped_spec}\")\n\
-               (func (export \"vzglyd_abi_version\") (result i32) i32.const 1)\n\
+               (func (export \"vzglyd_abi_version\") (result i32) i32.const 3)\n\
                (func (export \"vzglyd_spec_ptr\") (result i32) i32.const {spec_offset})\n\
                (func (export \"vzglyd_spec_len\") (result i32) i32.const {len})\n\
                (func (export \"vzglyd_init\") (result i32) i32.const 0)\n\
@@ -4526,6 +4593,7 @@ mod tests {
             "configurable-sidecar-test",
             Some(params),
             default_sidecar_request_executor(),
+            &[],
         )
         .expect("run configurable sidecar");
 
@@ -4576,6 +4644,7 @@ mod tests {
             "air-quality-sidecar-test",
             None,
             request_executor,
+            &[],
         )
         .expect("run sidecar");
 
@@ -4602,6 +4671,7 @@ mod tests {
             "legacy-sidecar-test",
             None,
             default_sidecar_request_executor(),
+            &[],
         )
         .expect_err("legacy socket imports should fail");
         let message = error.to_string();
@@ -4631,7 +4701,7 @@ mod tests {
                 err,
                 LoadError::AbiVersion {
                     found: 99,
-                    expected: 1
+                    expected: 3
                 }
             ),
             "expected AbiVersion error, got {err}"
@@ -4700,7 +4770,7 @@ mod tests {
             package_dir.join(PACKAGE_MANIFEST_NAME),
             r#"{
                 "name":"Scene Metadata Test",
-                "abi_version":1,
+                "abi_version":3,
                 "scene_space":"world_3d",
                 "assets":{
                     "scenes":[
@@ -4759,7 +4829,7 @@ mod tests {
             &package_dir,
             r#"{
                 "name":"Scene Compile Test",
-                "abi_version":1,
+                "abi_version":3,
                 "scene_space":"world_3d",
                 "assets":{
                     "scenes":[
@@ -4838,7 +4908,7 @@ mod tests {
             &package_dir,
             r#"{
                 "name":"Scene Compile Light Test",
-                "abi_version":1,
+                "abi_version":3,
                 "scene_space":"world_3d",
                 "assets":{
                     "scenes":[
@@ -4893,7 +4963,7 @@ mod tests {
             &package_dir,
             r#"{
                 "name":"Scene Compile Budget Test",
-                "abi_version":1,
+                "abi_version":3,
                 "scene_space":"world_3d",
                 "assets":{
                     "scenes":[
@@ -4940,7 +5010,7 @@ mod tests {
 
         let manifest = r#"{
             "name":"Mesh Override Test",
-            "abi_version":1,
+            "abi_version":3,
             "scene_space":"world_3d",
             "assets":{
                 "meshes":[
@@ -4996,7 +5066,7 @@ mod tests {
             &format!(
                 r#"{{
                     "name":"Runtime Mesh Asset Test",
-                    "abi_version":1,
+                    "abi_version":3,
                     "scene_space":"world_3d",
                     "assets":{{
                         "meshes":[
@@ -5058,7 +5128,7 @@ mod tests {
 
         let manifest = r#"{
             "name":"Built Package",
-            "abi_version":1,
+            "abi_version":3,
             "scene_space":"screen_2d"
         }"#;
         let wasm = b"fresh-slide-wasm";
@@ -5114,7 +5184,7 @@ cp built/sidecar.wasm sidecar.wasm
 
         let manifest = r#"{
             "name":"Relative Built Package",
-            "abi_version":1,
+            "abi_version":3,
             "scene_space":"screen_2d"
         }"#;
         let wasm = b"relative-slide-wasm";
@@ -5161,7 +5231,7 @@ cp built/slide.wasm slide.wasm
             &package_dir,
             r#"{
                 "name":"Mesh Override Test",
-                "abi_version":1,
+                "abi_version":3,
                 "scene_space":"world_3d",
                 "assets":{
                     "meshes":[
@@ -5567,7 +5637,7 @@ cp built/slide.wasm slide.wasm
 
         let manifest_json = r#"{
             "name":"Sound Test",
-            "abi_version":2,
+            "abi_version":3,
             "scene_space":"world_3d",
             "assets":{
                 "sounds":[
@@ -5608,7 +5678,7 @@ cp built/slide.wasm slide.wasm
 
         let manifest_json = r#"{
             "name":"Multi Sound Test",
-            "abi_version":2,
+            "abi_version":3,
             "scene_space":"world_3d",
             "assets":{
                 "sounds":[

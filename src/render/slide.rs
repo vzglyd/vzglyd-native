@@ -112,16 +112,17 @@ impl SlidePipelines {
 
 pub struct LoadedScreenSlide {
     pub spec: SlideSpec<ScreenVertex>,
-    pub runtime: Option<slide_loader::SlideRuntime>,
-    pub background_scene: Option<slide_loader::ScreenBackgroundScene>,
+    pub(crate) runtime: Option<slide_loader::SlideRuntime>,
+    pub(crate) background_scene: Option<slide_loader::ScreenBackgroundScene>,
 }
 
 pub struct LoadedWorldSlide {
     pub spec: SlideSpec<WorldVertex>,
-    pub runtime: Option<slide_loader::SlideRuntime>,
-    pub shader_source_hint: Option<slide_loader::ShaderSourceHint>,
+    pub(crate) runtime: Option<slide_loader::SlideRuntime>,
+    pub(crate) shader_source_hint: Option<slide_loader::ShaderSourceHint>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum LoadedSlide {
     Screen(LoadedScreenSlide),
     World(LoadedWorldSlide),
@@ -727,6 +728,16 @@ impl WorldSlideRenderer {
                 bytemuck::bytes_of(&uniforms),
             );
 
+            // Pre-compute per-mesh animation matrices for this frame.
+            let mesh_labels: Vec<String> = self
+                .spec
+                .static_meshes
+                .iter()
+                .map(|m| m.label.clone())
+                .collect();
+            let animation_matrices =
+                sample_animation_matrices(&self.spec.animations, self.elapsed, &mesh_labels);
+
             // Draw static meshes
             for draw in &self.spec.draws {
                 if let Some(pipeline) = self.pipelines.get(draw.pipeline) {
@@ -736,6 +747,16 @@ impl WorldSlideRenderer {
                             if let Some(mesh) = self.static_meshes.get(mesh_idx) {
                                 let draw_range_end = draw.index_range.end.min(mesh.index_count);
                                 if draw.index_range.start < draw_range_end {
+                                    let model = animation_matrices
+                                        .get(mesh_idx)
+                                        .copied()
+                                        .unwrap_or(Mat4::IDENTITY);
+                                    let cols = model.to_cols_array();
+                                    pass.set_push_constants(
+                                        wgpu::ShaderStages::VERTEX,
+                                        0,
+                                        bytemuck::bytes_of(&cols),
+                                    );
                                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                     pass.set_index_buffer(
                                         mesh.index_buffer.slice(..),
@@ -758,6 +779,13 @@ impl WorldSlideRenderer {
                                     draw.index_range.end.saturating_sub(draw.index_range.start);
                                 let count = available.min(requested);
                                 if count > 0 {
+                                    // Dynamic meshes manage their own transforms; use identity.
+                                    let cols = Mat4::IDENTITY.to_cols_array();
+                                    pass.set_push_constants(
+                                        wgpu::ShaderStages::VERTEX,
+                                        0,
+                                        bytemuck::bytes_of(&cols),
+                                    );
                                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                     pass.set_index_buffer(
                                         mesh.index_buffer.slice(..),
@@ -1111,6 +1139,7 @@ fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupL
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_screen_bind_group(
     device: &wgpu::Device,
     tex_view: &wgpu::TextureView,
@@ -1170,6 +1199,7 @@ fn make_screen_bind_group(
     (layout, bind_group)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_world_bind_group(
     device: &wgpu::Device,
     uniform_buffer: &wgpu::Buffer,
@@ -1242,7 +1272,7 @@ fn resolve_slide_shader_source(
                 .as_deref()
                 .or(sources.vertex_wgsl.as_deref())
         })
-        .unwrap_or_else(|| match (contract, shader_source_hint) {
+        .unwrap_or(match (contract, shader_source_hint) {
             (ShaderContract::World3D, Some(slide_loader::ShaderSourceHint::DefaultWorldScene)) => {
                 include_str!("../imported_scene_shader.wgsl")
             }
@@ -1341,6 +1371,99 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Sample animation clips at a given elapsed time and compute per-mesh model matrices.
+///
+/// Returns a Vec of model matrices indexed by mesh label position. Meshes without animation
+/// channels get `Mat4::IDENTITY`.
+fn sample_animation_matrices(
+    animations: &[vzglyd_slide::AnimationClip],
+    elapsed: f32,
+    mesh_labels: &[String],
+) -> Vec<Mat4> {
+    // Build label → index map
+    let label_to_index: std::collections::HashMap<&str, usize> = mesh_labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| (label.as_str(), i))
+        .collect();
+
+    let mut matrices = vec![Mat4::IDENTITY; mesh_labels.len()];
+
+    for clip in animations {
+        let t = if clip.duration > 0.0 {
+            if clip.looped {
+                let wrapped = elapsed % clip.duration;
+                // If we wrapped exactly to 0.0 (elapsed was an exact multiple of duration),
+                // treat it as the end of the clip to avoid discontinuity.
+                if wrapped == 0.0 && elapsed > 0.0 {
+                    clip.duration
+                } else {
+                    wrapped
+                }
+            } else {
+                elapsed.min(clip.duration)
+            }
+        } else {
+            0.0
+        };
+
+        for channel in &clip.channels {
+            let Some(&mesh_idx) = label_to_index.get(channel.node_label.as_str()) else {
+                continue;
+            };
+
+            if channel.keyframe_times.len() < 2 {
+                continue;
+            }
+
+            // Find the keyframe interval
+            let mut ki = 0;
+            while ki + 1 < channel.keyframe_times.len()
+                && channel.keyframe_times[ki + 1] < t
+            {
+                ki += 1;
+            }
+            if ki + 1 >= channel.keyframe_times.len() {
+                ki = channel.keyframe_times.len() - 2;
+            }
+
+            let t0 = channel.keyframe_times[ki];
+            let t1 = channel.keyframe_times[ki + 1];
+            let span = (t1 - t0).max(0.0001);
+            let lerp_t = ((t - t0) / span).clamp(0.0, 1.0);
+
+            let v0 = channel.keyframe_values[ki];
+            let v1 = channel.keyframe_values[ki + 1];
+
+            // Apply the channel's transform to the existing matrix
+            let delta = match channel.path {
+                vzglyd_slide::AnimationPath::Translation => {
+                    let dx = lerp(v0[0], v1[0], lerp_t);
+                    let dy = lerp(v0[1], v1[1], lerp_t);
+                    let dz = lerp(v0[2], v1[2], lerp_t);
+                    Mat4::from_translation(glam::Vec3::new(dx, dy, dz))
+                }
+                vzglyd_slide::AnimationPath::Rotation => {
+                    let q0 = glam::Quat::from_array([v0[0], v0[1], v0[2], v0[3]]);
+                    let q1 = glam::Quat::from_array([v1[0], v1[1], v1[2], v1[3]]);
+                    let q = q0.slerp(q1, lerp_t);
+                    Mat4::from_quat(q)
+                }
+                vzglyd_slide::AnimationPath::Scale => {
+                    let sx = lerp(v0[0], v1[0], lerp_t);
+                    let sy = lerp(v0[1], v1[1], lerp_t);
+                    let sz = lerp(v0[2], v1[2], lerp_t);
+                    Mat4::from_scale(glam::Vec3::new(sx, sy, sz))
+                }
+            };
+
+            matrices[mesh_idx] = delta * matrices[mesh_idx];
+        }
+    }
+
+    matrices
+}
+
 fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
@@ -1365,7 +1488,11 @@ fn create_slide_pipelines(
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{}_pipeline_layout", label_prefix)),
             bind_group_layouts: &[bind_group_layout],
-            push_constant_ranges: &[],
+            // World3D shaders declare var<push_constant> vzglyd_push (mat4x4<f32> = 64 bytes).
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::VERTEX,
+                range: 0..64,
+            }],
         });
 
     let has_opaque = draw_plan.iter().any(|d| d.pipeline == PipelineKind::Opaque);
@@ -1462,8 +1589,8 @@ fn create_slide_pipelines(
     });
 
     Ok(SlidePipelines {
-        opaque: opaque.map(|p| Arc::new(p)),
-        transparent: transparent.map(|p| Arc::new(p)),
+        opaque: opaque.map(Arc::new),
+        transparent: transparent.map(Arc::new),
     })
 }
 
@@ -1570,8 +1697,8 @@ fn create_screen_slide_pipelines(
     });
 
     Ok(SlidePipelines {
-        opaque: opaque.map(|p| Arc::new(p)),
-        transparent: transparent.map(|p| Arc::new(p)),
+        opaque: opaque.map(Arc::new),
+        transparent: transparent.map(Arc::new),
     })
 }
 
@@ -1685,6 +1812,405 @@ pub fn create_slide_renderer(ctx: &GpuContext, spec_bytes: &[u8]) -> Result<Slid
         DecodedSlideSpec::Screen(spec) => {
             Ok(SlideRenderer::Screen(ScreenSlideRenderer::new(ctx, spec)?))
         }
+    }
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::*;
+    use vzglyd_slide::{AnimationChannel, AnimationClip, AnimationPath};
+
+    #[test]
+    fn test_lerp_basic() {
+        assert_eq!(lerp(0.0, 10.0, 0.0), 0.0);
+        assert_eq!(lerp(0.0, 10.0, 0.5), 5.0);
+        assert_eq!(lerp(0.0, 10.0, 1.0), 10.0);
+        assert_eq!(lerp(-5.0, 5.0, 0.5), 0.0);
+        assert_eq!(lerp(10.0, 20.0, 0.25), 12.5);
+    }
+
+    #[test]
+    fn test_lerp_extrapolation() {
+        // lerp handles t outside [0, 1] by extrapolating
+        assert_eq!(lerp(0.0, 10.0, -0.5), -5.0);
+        assert_eq!(lerp(0.0, 10.0, 1.5), 15.0);
+    }
+
+    #[test]
+    fn test_slerp_identity_to_rotation() {
+        let q0 = glam::Quat::IDENTITY;
+        let q90_z = glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        
+        let q = q0.slerp(q90_z, 0.5);
+        let expected = glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_4);
+        
+        assert!((q.x - expected.x).abs() < 1e-6);
+        assert!((q.y - expected.y).abs() < 1e-6);
+        assert!((q.z - expected.z).abs() < 1e-6);
+        assert!((q.w - expected.w).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_slerp_full_rotation() {
+        let q0 = glam::Quat::IDENTITY;
+        let q180_y = glam::Quat::from_rotation_y(std::f32::consts::PI);
+        
+        let q = q0.slerp(q180_y, 1.0);
+        
+        // Quaternions have double cover: q and -q represent the same rotation.
+        // Compare the rotation matrices instead of raw components.
+        let mat_q = Mat4::from_quat(q);
+        let mat_expected = Mat4::from_quat(q180_y);
+        
+        for i in 0..16 {
+            let diff = (mat_q.to_cols_array()[i] - mat_expected.to_cols_array()[i]).abs();
+            assert!(diff < 1e-6, "Quaternion rotation mismatch at element {}", i);
+        }
+    }
+
+    #[test]
+    fn test_sample_animation_empty() {
+        let matrices = sample_animation_matrices(&[], 0.0, &["mesh1".to_string()]);
+        assert_eq!(matrices.len(), 1);
+        assert_eq!(matrices[0], Mat4::IDENTITY);
+    }
+
+    #[test]
+    fn test_sample_animation_translation() {
+        let channel = AnimationChannel {
+            node_label: "cube".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0, 1.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0, 0.0],
+            ],
+        };
+
+        let clip = AnimationClip {
+            name: "move".to_string(),
+            duration: 1.0,
+            looped: true,
+            channels: vec![channel],
+        };
+
+        let mesh_labels = vec!["cube".to_string()];
+
+        // Test at start - translation of (0,0,0) should still be identity matrix
+        let matrices = sample_animation_matrices(&[clip.clone()], 0.0, &mesh_labels);
+        // Mat4::from_translation(Vec3::ZERO) is identity
+        assert_eq!(matrices[0], Mat4::IDENTITY);
+
+        // Test at midpoint
+        let matrices = sample_animation_matrices(&[clip.clone()], 0.5, &mesh_labels);
+        let expected = Mat4::from_translation(glam::Vec3::new(5.0, 0.0, 0.0));
+        eprintln!("Midpoint matrix: {:?}", matrices[0]);
+        eprintln!("Expected: {:?}", expected);
+        assert!((matrices[0].w_axis.x - expected.w_axis.x).abs() < 1e-6, 
+            "w_axis.x mismatch: {} vs {}", matrices[0].w_axis.x, expected.w_axis.x);
+        assert!((matrices[0].w_axis.y - expected.w_axis.y).abs() < 1e-6);
+        assert!((matrices[0].w_axis.z - expected.w_axis.z).abs() < 1e-6);
+        
+        // Test at end
+        let matrices = sample_animation_matrices(&[clip.clone()], 1.0, &mesh_labels);
+        eprintln!("End matrix: {:?}", matrices[0]);
+        let expected_end = Mat4::from_translation(glam::Vec3::new(10.0, 0.0, 0.0));
+        eprintln!("Expected end: {:?}", expected_end);
+        assert!((matrices[0].w_axis.x - expected_end.w_axis.x).abs() < 1e-6,
+            "End w_axis.x mismatch: {} vs {}", matrices[0].w_axis.x, expected_end.w_axis.x);
+    }
+
+    #[test]
+    fn test_sample_animation_rotation() {
+        let channel = AnimationChannel {
+            node_label: "rotor".to_string(),
+            path: AnimationPath::Rotation,
+            keyframe_times: vec![0.0, 2.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 1.0], // identity quaternion
+                [0.0, 0.7071068, 0.0, 0.7071068], // 90° around Y
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "spin".to_string(),
+            duration: 2.0,
+            looped: true,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["rotor".to_string()];
+        
+        // Test at halfway (45° rotation)
+        let matrices = sample_animation_matrices(&[clip], 1.0, &mesh_labels);
+        let expected_q = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let expected = Mat4::from_quat(expected_q);
+        
+        // Compare matrix elements using to_cols_array()
+        let mat_arr = matrices[0].to_cols_array();
+        let exp_arr = expected.to_cols_array();
+        
+        for i in 0..16 {
+            assert!(
+                (mat_arr[i] - exp_arr[i]).abs() < 1e-5,
+                "Matrix element {} mismatch: {} vs {}",
+                i, mat_arr[i], exp_arr[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_sample_animation_scale() {
+        let channel = AnimationChannel {
+            node_label: "balloon".to_string(),
+            path: AnimationPath::Scale,
+            keyframe_times: vec![0.0, 1.0],
+            keyframe_values: vec![
+                [1.0, 1.0, 1.0, 0.0],
+                [2.0, 2.0, 2.0, 0.0],
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "grow".to_string(),
+            duration: 1.0,
+            looped: false,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["balloon".to_string()];
+        
+        // Test at midpoint
+        let matrices = sample_animation_matrices(&[clip], 0.5, &mesh_labels);
+        let expected = Mat4::from_scale(glam::Vec3::new(1.5, 1.5, 1.5));
+        
+        // Compare diagonal elements (scale values)
+        let mat_arr = matrices[0].to_cols_array();
+        let exp_arr = expected.to_cols_array();
+        
+        for i in 0..4 {
+            assert!(
+                (mat_arr[i * 5] - exp_arr[i * 5]).abs() < 1e-6,
+                "Scale axis {} mismatch",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_sample_animation_looping() {
+        let channel = AnimationChannel {
+            node_label: "spinner".to_string(),
+            path: AnimationPath::Rotation,
+            keyframe_times: vec![0.0, 1.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 0.0], // 180° around Y
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "loop".to_string(),
+            duration: 1.0,
+            looped: true,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["spinner".to_string()];
+        
+        // Test at t=1.5 (should wrap to 0.5)
+        let matrices = sample_animation_matrices(&[clip], 1.5, &mesh_labels);
+        let expected_q = glam::Quat::from_rotation_y(std::f32::consts::PI * 0.5);
+        let expected = Mat4::from_quat(expected_q);
+        
+        let mat_arr = matrices[0].to_cols_array();
+        let exp_arr = expected.to_cols_array();
+        
+        for i in 0..16 {
+            assert!(
+                (mat_arr[i] - exp_arr[i]).abs() < 1e-5,
+                "Looping matrix mismatch at {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_sample_animation_non_looped_clamping() {
+        let channel = AnimationChannel {
+            node_label: "door".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0, 2.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 3.0, 0.0, 0.0],
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "open".to_string(),
+            duration: 2.0,
+            looped: false,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["door".to_string()];
+        
+        // Test at t=3.0 (should clamp to end value)
+        let matrices = sample_animation_matrices(&[clip], 3.0, &mesh_labels);
+        let expected = Mat4::from_translation(glam::Vec3::new(0.0, 3.0, 0.0));
+        
+        assert!((matrices[0].w_axis.y - expected.w_axis.y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sample_animation_multiple_meshes() {
+        let channel1 = AnimationChannel {
+            node_label: "cube1".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0, 1.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0, 0.0],
+            ],
+        };
+        
+        let channel2 = AnimationChannel {
+            node_label: "cube2".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0, 1.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 5.0, 0.0, 0.0],
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "move_both".to_string(),
+            duration: 1.0,
+            looped: true,
+            channels: vec![channel1, channel2],
+        };
+        
+        let mesh_labels = vec![
+            "cube1".to_string(),
+            "cube2".to_string(),
+            "static".to_string(),
+        ];
+        
+        let matrices = sample_animation_matrices(&[clip], 1.0, &mesh_labels);
+        
+        assert_eq!(matrices.len(), 3);
+        assert_eq!(matrices[0], Mat4::from_translation(glam::Vec3::new(5.0, 0.0, 0.0)));
+        assert_eq!(matrices[1], Mat4::from_translation(glam::Vec3::new(0.0, 5.0, 0.0)));
+        assert_eq!(matrices[2], Mat4::IDENTITY); // Static mesh unchanged
+    }
+
+    #[test]
+    fn test_sample_animation_zero_duration() {
+        let channel = AnimationChannel {
+            node_label: "test".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0, 0.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "zero".to_string(),
+            duration: 0.0,
+            looped: true,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["test".to_string()];
+        let matrices = sample_animation_matrices(&[clip], 1.0, &mesh_labels);
+        
+        // Should remain identity when duration is zero
+        assert_eq!(matrices[0], Mat4::IDENTITY);
+    }
+
+    #[test]
+    fn test_sample_animation_missing_mesh_skipped() {
+        let channel = AnimationChannel {
+            node_label: "nonexistent".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0, 1.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0, 0.0],
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "ghost".to_string(),
+            duration: 1.0,
+            looped: true,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["actual_mesh".to_string()];
+        let matrices = sample_animation_matrices(&[clip], 0.5, &mesh_labels);
+        
+        // Should remain identity since mesh doesn't exist
+        assert_eq!(matrices[0], Mat4::IDENTITY);
+    }
+
+    #[test]
+    fn test_sample_animation_insufficient_keyframes() {
+        let channel = AnimationChannel {
+            node_label: "test".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0],
+            keyframe_values: vec![[0.0, 0.0, 0.0, 0.0]],
+        };
+        
+        let clip = AnimationClip {
+            name: "single_kf".to_string(),
+            duration: 1.0,
+            looped: true,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["test".to_string()];
+        let matrices = sample_animation_matrices(&[clip], 0.5, &mesh_labels);
+        
+        // Should remain identity with insufficient keyframes
+        assert_eq!(matrices[0], Mat4::IDENTITY);
+    }
+
+    #[test]
+    fn test_sample_animation_multiple_keyframes() {
+        // Test with 3 keyframes: start, middle, end
+        let channel = AnimationChannel {
+            node_label: "bouncer".to_string(),
+            path: AnimationPath::Translation,
+            keyframe_times: vec![0.0, 0.5, 1.0],
+            keyframe_values: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 5.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+        };
+        
+        let clip = AnimationClip {
+            name: "bounce".to_string(),
+            duration: 1.0,
+            looped: true,
+            channels: vec![channel],
+        };
+        
+        let mesh_labels = vec!["bouncer".to_string()];
+        
+        // Test at first interval (t=0.25)
+        let matrices = sample_animation_matrices(&[clip.clone()], 0.25, &mesh_labels);
+        assert!((matrices[0].w_axis.y - 2.5).abs() < 0.1);
+        
+        // Test at second interval (t=0.75)
+        let matrices = sample_animation_matrices(&[clip], 0.75, &mesh_labels);
+        assert!((matrices[0].w_axis.y - 2.5).abs() < 0.1);
     }
 }
 

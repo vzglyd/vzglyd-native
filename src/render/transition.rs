@@ -18,9 +18,10 @@ pub struct TransitionUniforms {
 }
 
 /// Transition kind matching the shader.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u32)]
 pub enum TransitionKind {
+    #[default]
     Crossfade = 0,
     WipeLeft = 1,
     WipeDown = 2,
@@ -46,12 +47,6 @@ impl TransitionKind {
     }
 }
 
-impl Default for TransitionKind {
-    fn default() -> Self {
-        Self::Crossfade
-    }
-}
-
 /// Transition renderer with pipeline and resources.
 pub struct TransitionRenderer {
     pub pipeline: Arc<wgpu::RenderPipeline>,
@@ -68,15 +63,11 @@ pub struct ActiveTransition {
 }
 
 /// Transition state machine.
+#[derive(Default)]
 pub enum TransitionState {
+    #[default]
     Idle,
     Blending(ActiveTransition),
-}
-
-impl Default for TransitionState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl TransitionState {

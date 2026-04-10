@@ -49,7 +49,7 @@ impl AudioEngine {
     /// Obtain the shared audio engine, initialising it on first call.
     pub fn global() -> Result<Self, AudioError> {
         GLOBAL_ENGINE
-            .get_or_init(|| Self::new())
+            .get_or_init(Self::new)
             .clone()
             .map_err(|e| e.clone())
     }
@@ -101,6 +101,12 @@ impl AudioEngine {
 /// for explicit control.
 pub struct SoundHandle {
     sink: Arc<Mutex<Sink>>,
+}
+
+impl std::fmt::Debug for SoundHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SoundHandle").finish_non_exhaustive()
+    }
 }
 
 impl SoundHandle {
@@ -387,6 +393,7 @@ mod tests {
     // ── SoundRegistry: play/stop lifecycle with WAV data ─────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn play_and_stop_wav_sound() {
         let mut registry = SoundRegistry::new();
         let wav = make_test_wav();
@@ -406,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn play_same_id_replaces_previous_sound() {
         let mut registry = SoundRegistry::new();
         let wav = make_test_wav();
@@ -424,6 +432,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn play_multiple_sounds_with_different_ids() {
         let mut registry = SoundRegistry::new();
         let wav = make_test_wav();
@@ -447,6 +456,7 @@ mod tests {
     // ── SoundRegistry: volume control ────────────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn set_volume_of_playing_sound_succeeds() {
         let mut registry = SoundRegistry::new();
         let wav = make_test_wav();
@@ -465,6 +475,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn volume_clamped_to_valid_range() {
         // This tests that extremely high/low volumes are clamped.
         // The clamping happens inside SoundHandle::set_volume which uses
@@ -487,6 +498,7 @@ mod tests {
     // ── SoundRegistry: pause/resume ──────────────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn pause_and_resume_playing_sound() {
         let mut registry = SoundRegistry::new();
         let wav = make_test_wav();
@@ -506,6 +518,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn pause_does_not_remove_sound_from_registry() {
         let mut registry = SoundRegistry::new();
         let wav = make_test_wav();
@@ -526,6 +539,7 @@ mod tests {
     // ── SoundHandle lifecycle ────────────────────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn sound_handle_stop_is_idempotent() {
         // Calling stop multiple times should not panic
         let wav = make_test_wav();
@@ -538,6 +552,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn sound_handle_pause_resume_cycle() {
         let wav = make_test_wav();
         let engine = AudioEngine::global().expect("audio engine should be available");
@@ -551,6 +566,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn sound_handle_volume_set_multiple_times() {
         let wav = make_test_wav();
         let engine = AudioEngine::global().expect("audio engine should be available");
@@ -567,6 +583,7 @@ mod tests {
     // ── AudioEngine: play with looped flag ───────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn play_looped_sound_succeeds() {
         let wav = make_test_wav();
         let engine = AudioEngine::global().expect("audio engine should be available");
@@ -581,6 +598,7 @@ mod tests {
     // ── AudioEngine: invalid audio data ──────────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn play_invalid_data_returns_decode_error() {
         let engine = AudioEngine::global().expect("audio engine should be available");
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
@@ -592,6 +610,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn play_empty_data_returns_decode_error() {
         let engine = AudioEngine::global().expect("audio engine should be available");
         let result = engine.play(&[], 0.5, false);
@@ -604,6 +623,7 @@ mod tests {
     // ── AudioEngine global singleton ─────────────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn audio_engine_global_returns_consistent_handle() {
         let engine1 = AudioEngine::global().expect("audio engine should be available");
         let engine2 = AudioEngine::global().expect("audio engine should be available");
@@ -620,6 +640,7 @@ mod tests {
     // ── SoundRegistry: full lifecycle ────────────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn full_play_set_volume_pause_resume_stop_lifecycle() {
         let mut registry = SoundRegistry::new();
         let wav = make_test_wav();
@@ -649,6 +670,7 @@ mod tests {
     // ── MP3 frame decoding ───────────────────────────────────────────────
 
     #[test]
+    #[ignore = "requires audio hardware (ALSA/PulseAudio); set up a virtual sink: pactl load-module module-null-sink sink_name=virtual0"]
     fn play_synthetic_mp3_frame() {
         // A hand-crafted synthetic MP3 frame does not decode through rodio's
         // symphonia decoder (lacks proper side-info). This test confirms the

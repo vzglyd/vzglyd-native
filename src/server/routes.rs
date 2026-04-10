@@ -7,14 +7,14 @@ use axum::body::Body;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use vzglyd_kernel::SecretsStore;
 use vzglyd_kernel::SlideLibraryEntry;
 use vzglyd_kernel::manifest::SlideManifest;
 use vzglyd_kernel::schedule::{PLAYLIST_FILENAME, parse_playlist};
 
-use super::secrets::{load_secrets, save_secrets};
+use super::secrets::save_secrets;
 use super::state::ServerState;
 
 // ── Embedded static assets ────────────────────────────────────────────────────
