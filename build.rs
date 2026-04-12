@@ -8,16 +8,51 @@ use std::{
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let slide_dir = manifest_dir.join("loading-slide");
 
-    // Rebuild whenever loading-slide source or assets change.
+    // ── 1. Compile loading-slide to wasm32-wasip1 ─────────────────────────────
+    let loading_slide_dir = manifest_dir.join("loading-slide");
     println!("cargo:rerun-if-changed=loading-slide/src");
     println!("cargo:rerun-if-changed=loading-slide/assets");
     println!("cargo:rerun-if-changed=loading-slide/art");
     println!("cargo:rerun-if-changed=loading-slide/manifest.json");
     println!("cargo:rerun-if-changed=loading-slide/Cargo.toml");
 
-    // ── 1. Compile loading-slide to wasm32-wasip1 ─────────────────────────────
+    compile_wasm_slide(&manifest_dir, &loading_slide_dir, "loading_slide")
+        .expect("loading-slide wasm build failed");
+
+    let loading_wasm = resolve_slide_wasm(&manifest_dir, &loading_slide_dir, "loading_slide")
+        .unwrap_or_else(|| panic!("failed to locate compiled loading slide wasm after build"));
+
+    // Pack loading.vzglyd
+    let loading_vzglyd = out_dir.join("loading.vzglyd");
+    pack_vzglyd(&loading_vzglyd, &loading_wasm, &loading_slide_dir, &["assets", "art"])
+        .expect("failed to pack loading.vzglyd");
+
+    // ── 2. Compile information-slide to wasm32-wasip1 ────────────────────────
+    let info_slide_dir = manifest_dir.join("information-slide");
+    println!("cargo:rerun-if-changed=information-slide/src");
+    println!("cargo:rerun-if-changed=information-slide/manifest.json");
+    println!("cargo:rerun-if-changed=information-slide/Cargo.toml");
+
+    compile_wasm_slide(&manifest_dir, &info_slide_dir, "information_slide")
+        .expect("information-slide wasm build failed");
+
+    let info_wasm = resolve_slide_wasm(&manifest_dir, &info_slide_dir, "information_slide")
+        .unwrap_or_else(|| panic!("failed to locate compiled information slide wasm after build"));
+
+    // Pack information.vzglyd
+    let info_vzglyd = out_dir.join("information.vzglyd");
+    pack_vzglyd(&info_vzglyd, &info_wasm, &info_slide_dir, &[])
+        .expect("failed to pack information.vzglyd");
+
+    println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn compile_wasm_slide(
+    _manifest_dir: &Path,
+    slide_dir: &Path,
+    package_name: &str,
+) -> Result<(), String> {
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .args([
             "build",
@@ -29,28 +64,29 @@ fn main() {
             "--quiet",
         ])
         .status()
-        .expect("failed to invoke cargo for loading-slide");
+        .map_err(|e| format!("failed to invoke cargo for {}: {}", package_name, e))?;
 
     if !status.success() {
-        panic!("loading-slide wasm build failed");
+        return Err(format!("{} wasm build failed", package_name));
     }
 
-    let wasm_src = resolve_loading_slide_wasm(&manifest_dir, &slide_dir)
-        .unwrap_or_else(|| panic!("failed to locate compiled loading slide wasm after build"));
+    // Rebuild whenever slide source changes.
+    println!("cargo:rerun-if-changed={}/src", package_name.replace('-', "_"));
 
-    // ── 2. Pack loading.vzglyd (zip) ──────────────────────────────────────────
-    let vzglyd_path = out_dir.join("loading.vzglyd");
-    pack_vzglyd(&vzglyd_path, &wasm_src, &slide_dir).expect("failed to pack loading.vzglyd");
-
-    println!("cargo:rerun-if-changed=build.rs");
+    Ok(())
 }
 
-fn resolve_loading_slide_wasm(manifest_dir: &Path, slide_dir: &Path) -> Option<PathBuf> {
+fn resolve_slide_wasm(
+    manifest_dir: &Path,
+    slide_dir: &Path,
+    slide_name: &str,
+) -> Option<PathBuf> {
+    let wasm_file = format!("{}.wasm", slide_name);
     let candidates = [
-        manifest_dir.join("target/wasm32-wasip1/release/loading_slide.wasm"),
-        manifest_dir.join("target/wasm32-wasip1/release/deps/loading_slide.wasm"),
-        slide_dir.join("target/wasm32-wasip1/release/loading_slide.wasm"),
-        slide_dir.join("target/wasm32-wasip1/release/deps/loading_slide.wasm"),
+        manifest_dir.join(format!("target/wasm32-wasip1/release/{}", wasm_file)),
+        manifest_dir.join(format!("target/wasm32-wasip1/release/deps/{}", wasm_file)),
+        slide_dir.join(format!("target/wasm32-wasip1/release/{}", wasm_file)),
+        slide_dir.join(format!("target/wasm32-wasip1/release/deps/{}", wasm_file)),
     ];
 
     candidates.into_iter().find(|path| path.exists())
@@ -60,6 +96,7 @@ fn pack_vzglyd(
     out: &Path,
     wasm: &Path,
     slide_dir: &Path,
+    subdirs: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::BufWriter;
 
@@ -76,8 +113,9 @@ fn pack_vzglyd(
     zip.start_file("slide.wasm", stored)?;
     zip.write_all(&fs::read(wasm)?)?;
 
-    pack_child_dir(&mut zip, stored, slide_dir, "assets")?;
-    pack_child_dir(&mut zip, stored, slide_dir, "art")?;
+    for dir in subdirs {
+        pack_child_dir(&mut zip, stored, slide_dir, dir)?;
+    }
 
     zip.finish()?;
     Ok(())

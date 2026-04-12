@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use vzglyd_kernel::SecretsStore;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use vzglyd_kernel::TransitionKind as KernelTransitionKind;
+use vzglyd_kernel::InfoReason;
 use vzglyd_kernel::schedule::{PLAYLIST_FILENAME, Playlist, parse_playlist};
 use vzglyd_kernel::{
     Engine, EngineConfig, EngineInput, FrameRenderState, Host, LogLevel, RenderCommand, SlideEntry,
@@ -40,6 +41,7 @@ use crate::trace::set_active_trace_recorder;
 
 const LOADING_SCENE_PATH: &str = "$loading";
 const LOADING_SLIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/loading.vzglyd"));
+const INFORMATION_SLIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/information.vzglyd"));
 #[cfg(target_os = "linux")]
 const X11_BORDERLESS_INSET: u32 = 1;
 static SHUTDOWN_SIGNAL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -112,6 +114,12 @@ pub struct NativeApp {
     /// Frame counter and time for rolling FPS calculation.
     fps_frame_count: u32,
     fps_window_start: Option<Instant>,
+
+    // Information slide state (kernel-driven, host-rendered).
+    info_renderer: Option<LoadedSlideRenderer>,
+    info_target: Option<OffscreenTarget>,
+    /// Overlay text lines shown on top of the info slide.
+    info_overlay_text: Vec<String>,
 }
 
 /// Loaded slide renderer with metadata and the optional extracted archive directory.
@@ -213,6 +221,9 @@ impl NativeApp {
             app_status: Arc::new(RwLock::new(AppStatus::default())),
             fps_frame_count: 0,
             fps_window_start: None,
+            info_renderer: None,
+            info_target: None,
+            info_overlay_text: Vec::new(),
         })
     }
 
@@ -257,9 +268,33 @@ impl NativeApp {
         if let Some(mut engine) = app.engine.take() {
             let mut host = HostWrapper { app: &mut app };
             engine.init(&mut host);
-            let (slides, display_scale) = load_schedule(&mut engine, &app.run_config)?;
-            app.slides = slides;
-            app.display_scale = display_scale;
+            match load_schedule(&mut engine, &app.run_config) {
+                Ok((slides, display_scale)) => {
+                    app.slides = slides;
+                    app.display_scale = display_scale;
+                }
+                Err(info_reason) => {
+                    // Instead of failing, enter info mode — the info slide will be shown.
+                    let url = management_console_url();
+                    let reason = match info_reason {
+                        InfoReason::MissingPlaylist { .. } => {
+                            let slides_dir = app.run_config.slides_dir.as_deref().unwrap_or("slides");
+                            vzglyd_kernel::missing_playlist_info(slides_dir, &url)
+                        }
+                        InfoReason::InvalidPlaylist { error, .. } => {
+                            vzglyd_kernel::invalid_playlist_info(&error, &url)
+                        }
+                        InfoReason::EmptyPlaylist { .. } => {
+                            vzglyd_kernel::empty_playlist_info(&url)
+                        }
+                        InfoReason::Alert { title, lines } => {
+                            InfoReason::Alert { title, lines }
+                        }
+                    };
+                    engine.show_info_slide(reason);
+                    engine.set_slides_dir(app.run_config.slides_dir.as_deref().unwrap_or("slides"));
+                }
+            }
             app.engine = Some(engine);
         }
 
@@ -272,6 +307,10 @@ impl NativeApp {
 
     fn is_bootstrapping(&self) -> bool {
         self.bootstrap_renderer.is_some() && self.pending_rx.is_some()
+    }
+
+    fn is_info_active(&self) -> bool {
+        self.info_renderer.is_some()
     }
 
     fn exit_for_signal(&mut self, event_loop: &ActiveEventLoop) -> bool {
@@ -367,6 +406,51 @@ impl NativeApp {
                 self.bootstrap_target = Some(ctx.create_offscreen_target());
             }
         }
+    }
+
+    fn try_init_info_renderer(&mut self) {
+        if self.context.is_none() {
+            return;
+        }
+        if self.info_renderer.is_some() {
+            return; // Already initialized.
+        }
+
+        let ctx = self.context.as_ref().expect("checked above");
+        match load_wasm_slide_from_bytes(INFORMATION_SLIDE)
+            .map_err(|error| format!("loading slide: {error}"))
+            .and_then(|(slide, _manifest)| create_loaded_slide_renderer(ctx, slide))
+        {
+            Ok(renderer) => {
+                self.info_renderer = Some(LoadedSlideRenderer {
+                    renderer,
+                    manifest: None,
+                });
+                self.set_window_title("VZGLYD — Information".to_string());
+                log::info!("information slide renderer initialized");
+            }
+            Err(error) => {
+                log::error!("failed to initialize information slide renderer: {error}");
+            }
+        }
+    }
+
+    fn ensure_info_target(&mut self) {
+        if self.info_target.is_none() {
+            if let Some(ctx) = &self.context {
+                self.info_target = Some(ctx.create_offscreen_target());
+            }
+        }
+    }
+
+    /// Update the overlay text lines from the kernel's current InfoReason.
+    fn update_info_overlay_text(&mut self) {
+        let Some(engine) = self.engine.as_ref() else { return };
+        let Some(reason) = engine.info_reason() else { return };
+
+        let mut lines = vec![reason.primary_message()];
+        lines.extend(reason.detail_lines());
+        self.info_overlay_text = lines;
     }
 
     /// Spawns the background slide-loader thread.
@@ -527,6 +611,60 @@ impl NativeApp {
         }
     }
 
+    /// Poll the kernel for info slide recovery.
+    ///
+    /// When the underlying issue (e.g. missing playlist.json) is resolved,
+    /// the info slide is dismissed and normal playlist loading begins.
+    fn poll_info_recovery(&mut self) {
+        if !self.is_info_active() {
+            return;
+        }
+
+        let Some(engine) = self.engine.as_mut() else { return };
+
+        if !engine.poll_info_recovery() {
+            return;
+        }
+
+        // Recovery detected — clear info slide and load normal schedule.
+        log::info!("[info] recovery detected — loading normal schedule");
+        self.info_renderer = None;
+        self.info_target = None;
+        self.info_overlay_text.clear();
+
+        // Re-run schedule loading with the now-valid playlist.
+        if let Some(slides_dir) = self.run_config.slides_dir.as_deref() {
+            match load_schedule(engine, &self.run_config) {
+                Ok((slides, display_scale)) => {
+                    self.slides = slides;
+                    self.display_scale = display_scale;
+                    self.start_background_load();
+                    self.try_init_bootstrap_renderer();
+                }
+                Err(reason) => {
+                    // Still not valid — update the info reason.
+                    let url = management_console_url();
+                    match reason {
+                        InfoReason::MissingPlaylist { .. } => {
+                            engine.show_info_slide(vzglyd_kernel::missing_playlist_info(
+                                slides_dir, &url,
+                            ));
+                        }
+                        InfoReason::InvalidPlaylist { error, .. } => {
+                            engine.show_info_slide(vzglyd_kernel::invalid_playlist_info(&error, &url));
+                        }
+                        InfoReason::EmptyPlaylist { .. } => {
+                            engine.show_info_slide(vzglyd_kernel::empty_playlist_info(&url));
+                        }
+                        InfoReason::Alert { .. } => {
+                            // Alert mode doesn't auto-recover.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Update the shared AppStatus with the current FPS (rolling 1-second window).
     fn update_fps_status(&mut self, dt: f32) {
         self.fps_frame_count += 1;
@@ -646,6 +784,44 @@ impl NativeApp {
         }
     }
 
+    /// Renders the information slide — shown when manual intervention is required.
+    fn render_info(&mut self, dt: f32) {
+        self.ensure_info_target();
+
+        let result = {
+            let Some(ctx) = &self.context else { return };
+            let Some(target) = self.info_target.as_ref() else { return };
+            let Some(renderer) = self.info_renderer.as_mut() else { return };
+
+            renderer.renderer.set_active(true);
+            Self::update_and_render_renderer(renderer, ctx, target, dt);
+
+            // Blit the info slide to the surface, then overlay text on top.
+            let bind_group = ctx.create_blit_bind_group(target);
+            if let Some(overlay) = self.overlay_renderer.as_mut() {
+                ctx.blit_and_overlay_to_surface(target, &bind_group, |view, encoder| {
+                    overlay.record_info_pass(
+                        ctx,
+                        view,
+                        encoder,
+                        &self.info_overlay_text,
+                        ctx.surface_display_rect(),
+                    );
+                })
+            } else {
+                ctx.blit_to_surface(target, &bind_group)
+            }
+        };
+
+        if let Err(error) = result {
+            self.handle_surface_error(error);
+        }
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     /// Renders the current frame, driven entirely by kernel `frame_state()`.
     fn render_frame(&mut self, dt: f32) {
         let _frame_trace = self
@@ -654,6 +830,12 @@ impl NativeApp {
             .map(|recorder| recorder.scoped("native.main", "frame", "render_frame"));
         if self.is_bootstrapping() {
             self.render_bootstrap(dt);
+            return;
+        }
+
+        // Info slide takes priority over normal content.
+        if self.is_info_active() {
+            self.render_info(dt);
             return;
         }
 
@@ -1055,7 +1237,7 @@ fn schedule_snapshot(engine: &Engine) -> Vec<ScheduledSlide> {
 fn load_schedule(
     engine: &mut Engine,
     run_config: &RunConfig,
-) -> Result<(Vec<ScheduledSlide>, f32), String> {
+) -> Result<(Vec<ScheduledSlide>, f32), InfoReason> {
     if let Some(scene_path) = run_config.scene_path.as_ref() {
         eprintln!("[vzglyd] single-scene mode: {scene_path}");
         engine.set_schedule(vec![scene_path.clone()]);
@@ -1071,18 +1253,27 @@ fn load_schedule(
     eprintln!("[vzglyd] using shared slides repo root: {}", slides_dir);
 
     if !playlist_path.exists() {
-        return Err(format!(
-            "shared slides repo '{}' is missing required {}",
-            slides_dir, PLAYLIST_FILENAME
-        ));
+        return Err(InfoReason::MissingPlaylist {
+            slides_dir: slides_dir.to_string(),
+            management_url: String::new(), // Will be filled in by caller.
+        });
     }
 
     let bytes = std::fs::read(&playlist_path)
-        .map_err(|error| format!("failed to read {}: {}", playlist_path.display(), error))?;
+        .map_err(|error| InfoReason::InvalidPlaylist {
+            error: format!("failed to read {}: {}", playlist_path.display(), error),
+            management_url: String::new(),
+        })?;
     let playlist = parse_playlist(&bytes)
-        .map_err(|error| format!("invalid {}: {}", playlist_path.display(), error))?;
+        .map_err(|error| InfoReason::InvalidPlaylist {
+            error: format!("invalid {}: {}", playlist_path.display(), error),
+            management_url: String::new(),
+        })?;
     validate_shared_repo_playlist(&playlist)
-        .map_err(|error| format!("invalid {}: {}", playlist_path.display(), error))?;
+        .map_err(|error| InfoReason::InvalidPlaylist {
+            error: format!("invalid {}: {}", playlist_path.display(), error),
+            management_url: String::new(),
+        })?;
 
     let display_scale = playlist.display_scale;
     engine.set_schedule_from_playlist(&playlist, slides_dir);
@@ -1133,6 +1324,34 @@ fn validate_shared_repo_bundle_path(path: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Misc helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the local LAN IP address for the management console URL.
+///
+/// Falls back to `"localhost"` if no suitable address is found.
+fn local_ip_address() -> String {
+    // Prefer a non-loopback IPv4 address on a private network.
+    let candidates = || {
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|socket| {
+                // Connecting to a public DNS gives us our local interface IP
+                // without actually sending any packets (UDP connect is stateless).
+                socket.connect("8.8.8.8:80").ok()?;
+                socket.local_addr().ok()
+            })
+            .map(|addr| addr.ip())
+    };
+
+    candidates()
+        .filter(|ip| ip.is_ipv4() && !ip.is_loopback())
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// Build the management console URL shown to the user on the info slide.
+fn management_console_url() -> String {
+    format!("http://{}:8080", local_ip_address())
+}
 
 fn scene_title(path: &str) -> String {
     let label = std::path::Path::new(path)
@@ -1341,6 +1560,12 @@ impl ApplicationHandler for NativeApp {
             }
         }
 
+        // If the kernel has an info slide active, initialize the info renderer.
+        if self.engine.as_ref().is_some_and(|e| e.info_reason().is_some()) {
+            self.try_init_info_renderer();
+            self.update_info_overlay_text();
+        }
+
         // Window is up — start loading slides in the background.
         self.start_background_load();
 
@@ -1378,6 +1603,14 @@ impl ApplicationHandler for NativeApp {
 
                 // Check for playlist hot-reload from management server.
                 self.poll_playlist_reload();
+
+                // Check for info slide recovery (e.g. playlist.json appeared).
+                self.poll_info_recovery();
+
+                // Update info overlay text from kernel state each frame.
+                if self.is_info_active() {
+                    self.update_info_overlay_text();
+                }
 
                 // Update FPS in shared AppStatus.
                 self.update_fps_status(dt);

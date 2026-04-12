@@ -365,4 +365,68 @@ impl OverlayRenderer {
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
     }
+
+    /// Records an overlay pass for the information slide.
+    ///
+    /// Renders centered text lines on top of the already-blitted info slide,
+    /// using the same font atlas and pipeline as the HUD overlay.
+    pub fn record_info_pass(
+        &mut self,
+        ctx: &GpuContext,
+        view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+        lines: &[String],
+        blit_rect: (u32, u32, u32, u32),
+    ) {
+        let (vp_x, vp_y, sw, sh) = blit_rect;
+
+        let (vertices, indices) =
+            vzglyd_kernel::build_info_geometry(&self.glyph_map, sw, sh, lines);
+
+        if vertices.len() > self.vertex_capacity {
+            self.vertex_capacity = vertices.len().next_power_of_two();
+            self.vertex_buffer = Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay_vertex_buffer"),
+                size: (self.vertex_capacity * std::mem::size_of::<OverlayVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        if indices.len() > self.index_capacity {
+            self.index_capacity = indices.len().next_power_of_two();
+            self.index_buffer = Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay_index_buffer"),
+                size: (self.index_capacity * std::mem::size_of::<u16>()) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
+        ctx.queue
+            .write_buffer(&self.vertex_buffer, 0, cast_slice(&vertices));
+        ctx.queue
+            .write_buffer(&self.index_buffer, 0, cast_slice(&indices));
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("info_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_viewport(vp_x as f32, vp_y as f32, sw as f32, sh as f32, 0.0, 1.0);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+    }
 }
