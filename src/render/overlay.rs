@@ -8,7 +8,10 @@
 use bytemuck::cast_slice;
 use chrono::Local;
 use std::sync::Arc;
-use vzglyd_kernel::{OverlayVertex, build_font_atlas_pixels, build_hud_geometry, build_screensaver_geometry, ScreensaverFrameState};
+use vzglyd_kernel::{
+    OverlayVertex, ScreensaverFrameState, build_font_atlas_pixels, build_hud_geometry_with_update,
+    build_screensaver_geometry,
+};
 
 use crate::gpu::context::GpuContext;
 
@@ -230,13 +233,21 @@ impl OverlayRenderer {
         view: &wgpu::TextureView,
         encoder: &mut wgpu::CommandEncoder,
         slide_name: Option<&str>,
+        updated_str: Option<&str>,
         blit_rect: (u32, u32, u32, u32),
     ) {
         let clock_str = Local::now().format("%H:%M:%S").to_string();
         let (vp_x, vp_y, sw, sh) = blit_rect;
 
         let (vertices, indices): (Vec<OverlayVertex>, Vec<u16>) =
-            build_hud_geometry(&self.glyph_map, sw, sh, slide_name, &clock_str);
+            build_hud_geometry_with_update(
+                &self.glyph_map,
+                sw,
+                sh,
+                slide_name,
+                &clock_str,
+                updated_str,
+            );
 
         if vertices.len() > self.vertex_capacity {
             self.vertex_capacity = vertices.len().next_power_of_two();

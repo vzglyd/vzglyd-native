@@ -32,8 +32,39 @@ fn temp_slide_dir(label: &str) -> PathBuf {
 
 /// Write a minimal manifest.json + dummy slide.wasm to a slide directory.
 fn write_minimal_slide(dir: &PathBuf, manifest_json: &str) {
-    fs::write(dir.join("manifest.json"), manifest_json).expect("write manifest");
+    write_required_art_assets(dir);
+    fs::write(dir.join("manifest.json"), manifest_with_required_art(manifest_json))
+        .expect("write manifest");
     fs::write(dir.join("slide.wasm"), b"\0asm\x01\0\0\0").expect("write dummy wasm");
+}
+
+fn write_required_art_assets(dir: &PathBuf) {
+    let art_dir = dir.join("art");
+    fs::create_dir_all(&art_dir).expect("create art dir");
+    fs::write(art_dir.join("j-card.png"), b"j-card").expect("write j-card art");
+    fs::write(art_dir.join("side-a.png"), b"side-a").expect("write side A art");
+    fs::write(art_dir.join("side-b.png"), b"side-b").expect("write side B art");
+}
+
+fn manifest_with_required_art(manifest: &str) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(manifest).expect("test manifest should be valid JSON");
+    let object = value.as_object_mut().expect("test manifest should be an object");
+    let assets = object
+        .entry("assets")
+        .or_insert_with(|| serde_json::json!({}));
+    let assets_object = assets
+        .as_object_mut()
+        .expect("test manifest assets should be an object");
+    assets_object.insert(
+        "art".into(),
+        serde_json::json!({
+            "j_card": { "path": "art/j-card.png" },
+            "side_a_label": { "path": "art/side-a.png" },
+            "side_b_label": { "path": "art/side-b.png" }
+        }),
+    );
+    serde_json::to_string(&value).expect("serialize test manifest")
 }
 
 /// Get a GLB file to test with. Uses the loading-slide's world.glb if available.

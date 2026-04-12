@@ -714,6 +714,12 @@ impl NativeApp {
             .and_then(|r| r.as_ref())
             .and_then(|r| r.manifest.as_ref())
             .and_then(|m| m.name.clone());
+        let updated_str: Option<String> = self
+            .slide_renderers
+            .get(display_idx)
+            .and_then(|r| r.as_ref())
+            .and_then(|r| r.renderer.last_network_request_unix_secs())
+            .and_then(format_updated_text);
 
         let result = match frame_state.next_slide_idx {
             None => {
@@ -725,7 +731,14 @@ impl NativeApp {
                     let bg = ctx.create_blit_bind_group(o);
                     if let Some(overlay) = self.overlay_renderer.as_mut() {
                         ctx.blit_and_overlay_to_surface(o, &bg, |view, encoder| {
-                            overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_display_rect());
+                            overlay.record_pass(
+                                ctx,
+                                view,
+                                encoder,
+                                slide_name.as_deref(),
+                                updated_str.as_deref(),
+                                ctx.surface_display_rect(),
+                            );
                         })
                     } else {
                         ctx.blit_to_surface(o, &bg)
@@ -749,7 +762,14 @@ impl NativeApp {
                         let bg = ctx.create_blit_bind_group(o);
                         if let Some(overlay) = self.overlay_renderer.as_mut() {
                             ctx.blit_and_overlay_to_surface(o, &bg, |view, encoder| {
-                                overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_display_rect());
+                                overlay.record_pass(
+                                    ctx,
+                                    view,
+                                    encoder,
+                                    slide_name.as_deref(),
+                                    updated_str.as_deref(),
+                                    ctx.surface_display_rect(),
+                                );
                             })
                         } else {
                             ctx.blit_to_surface(o, &bg)
@@ -771,7 +791,14 @@ impl NativeApp {
                     let bg = ctx.create_blit_bind_group(comp);
                     if let Some(overlay) = self.overlay_renderer.as_mut() {
                         ctx.blit_and_overlay_to_surface(comp, &bg, |view, encoder| {
-                            overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_display_rect());
+                            overlay.record_pass(
+                                ctx,
+                                view,
+                                encoder,
+                                slide_name.as_deref(),
+                                updated_str.as_deref(),
+                                ctx.surface_display_rect(),
+                            );
                         })
                     } else {
                         ctx.blit_to_surface(comp, &bg)
@@ -786,7 +813,14 @@ impl NativeApp {
                         let bg = ctx.create_blit_bind_group(o);
                         if let Some(overlay) = self.overlay_renderer.as_mut() {
                             ctx.blit_and_overlay_to_surface(o, &bg, |view, encoder| {
-                                overlay.record_pass(ctx, view, encoder, slide_name.as_deref(), ctx.surface_display_rect());
+                                overlay.record_pass(
+                                    ctx,
+                                    view,
+                                    encoder,
+                                    slide_name.as_deref(),
+                                    updated_str.as_deref(),
+                                    ctx.surface_display_rect(),
+                                );
                             })
                         } else {
                             ctx.blit_to_surface(o, &bg)
@@ -1114,6 +1148,12 @@ fn initial_window_title(slides: &[ScheduledSlide]) -> String {
     } else {
         scene_title(LOADING_SCENE_PATH)
     }
+}
+
+fn format_updated_text(unix_secs: u64) -> Option<String> {
+    let system_time = UNIX_EPOCH.checked_add(std::time::Duration::from_secs(unix_secs))?;
+    let local_time: chrono::DateTime<chrono::Local> = system_time.into();
+    Some(format!("UPDATED {}", local_time.format("%H:%M:%S")))
 }
 
 fn build_window_attributes(event_loop: &ActiveEventLoop, title: &str) -> WindowAttributes {

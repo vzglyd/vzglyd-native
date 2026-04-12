@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 720" role="img" aria-label="Loading J-card">
+  <rect width="720" height="720" fill="#101820"/>
+  <rect x="46" y="46" width="628" height="628" rx="24" fill="#f4d35e"/>
+  <rect x="86" y="100" width="548" height="324" rx="18" fill="#1d3557"/>
+  <rect x="86" y="456" width="548" height="72" rx="8" fill="#101820"/>
+  <rect x="86" y="552" width="360" height="34" rx="6" fill="#101820"/>
+  <text x="110" y="496" fill="#f7fff7" font-family="monospace" font-size="42" font-weight="700">LOADING</text>
+  <text x="110" y="596" fill="#101820" font-family="monospace" font-size="28" font-weight="700">VRX-64</text>
+  <circle cx="214" cy="262" r="62" fill="#f4d35e"/>
+  <circle cx="506" cy="262" r="62" fill="#f4d35e"/>
+  <rect x="254" y="244" width="212" height="36" rx="18" fill="#f4d35e"/>
+</svg>

@@ -83,6 +83,7 @@ impl std::fmt::Debug for HostSoundCatalog {
 struct SlideMailboxState {
     latest: Option<Vec<u8>>,
     dirty: bool,
+    last_network_request_unix_secs: Option<u64>,
 }
 
 struct SlideMailbox {
@@ -96,6 +97,7 @@ impl SlideMailbox {
             state: Mutex::new(SlideMailboxState {
                 latest: None,
                 dirty: false,
+                last_network_request_unix_secs: None,
             }),
             active: AtomicBool::new(false),
         }
@@ -116,6 +118,24 @@ impl SlideMailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.latest = Some(bytes);
         state.dirty = true;
+    }
+
+    fn mark_network_request(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_network_request_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs());
+    }
+
+    fn last_network_request_unix_secs(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_network_request_unix_secs
     }
 }
 
@@ -404,6 +424,10 @@ impl SlideRuntime {
 
     pub(crate) fn has_dynamic_meshes(&self) -> bool {
         self.dynamic_meshes_ptr.is_some() && self.dynamic_meshes_len.is_some()
+    }
+
+    pub(crate) fn last_network_request_unix_secs(&self) -> Option<u64> {
+        self.store.data().rx.last_network_request_unix_secs()
     }
 
     fn teardown(&mut self, timeout: Duration) -> Result<TeardownOutcome, LoadError> {
@@ -1031,6 +1055,7 @@ fn run_sidecar_module(
                     Ok(bytes) => bytes,
                     Err(_) => return HOST_ERROR,
                 };
+                caller.data().tx.mark_network_request();
                 let mut trace = caller.data().trace_recorder.clone().map(|recorder| {
                     let mut span = recorder.scoped(
                         caller.data().trace_thread.clone(),
@@ -2686,6 +2711,20 @@ fn collect_pack_files(
     }
 
     if let Some(assets) = manifest.assets.as_ref() {
+        if let Some(art) = assets.art.as_ref() {
+            files.insert(
+                PathBuf::from(&art.j_card.path),
+                asset_loader.resolve(&art.j_card.path)?,
+            );
+            files.insert(
+                PathBuf::from(&art.side_a_label.path),
+                asset_loader.resolve(&art.side_a_label.path)?,
+            );
+            files.insert(
+                PathBuf::from(&art.side_b_label.path),
+                asset_loader.resolve(&art.side_b_label.path)?,
+            );
+        }
         for texture in &assets.textures {
             files.insert(
                 PathBuf::from(&texture.path),
@@ -3745,8 +3784,44 @@ mod tests {
     }
 
     fn write_package_root(dir: &Path, manifest: &str, wasm: &[u8]) {
-        std::fs::write(dir.join(PACKAGE_MANIFEST_NAME), manifest).expect("write manifest");
+        write_required_art_assets(dir);
+        std::fs::write(
+            dir.join(PACKAGE_MANIFEST_NAME),
+            manifest_with_required_art(manifest),
+        )
+        .expect("write manifest");
         std::fs::write(dir.join(PACKAGE_WASM_NAME), wasm).expect("write wasm");
+    }
+
+    fn write_required_art_assets(dir: &Path) {
+        let art_dir = dir.join("art");
+        std::fs::create_dir_all(&art_dir).expect("create art dir");
+        std::fs::write(art_dir.join("j-card.png"), b"j-card").expect("write j-card art");
+        std::fs::write(art_dir.join("side-a.png"), b"side-a").expect("write side A art");
+        std::fs::write(art_dir.join("side-b.png"), b"side-b").expect("write side B art");
+    }
+
+    fn manifest_with_required_art(manifest: &str) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(manifest).expect("test manifest should be valid JSON");
+        let object = value
+            .as_object_mut()
+            .expect("test manifest should be an object");
+        let assets = object
+            .entry("assets")
+            .or_insert_with(|| serde_json::json!({}));
+        let assets_object = assets
+            .as_object_mut()
+            .expect("test manifest assets should be an object");
+        assets_object.insert(
+            "art".into(),
+            serde_json::json!({
+                "j_card": { "path": "art/j-card.png" },
+                "side_a_label": { "path": "art/side-a.png" },
+                "side_b_label": { "path": "art/side-b.png" }
+            }),
+        );
+        serde_json::to_string(&value).expect("serialize test manifest")
     }
 
     fn write_png(path: &Path, width: u32, height: u32, data: &[u8]) {
@@ -4654,6 +4729,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(state.latest.as_deref(), Some(expected_response.as_slice()));
         assert!(state.dirty);
+        assert!(state.last_network_request_unix_secs.is_some());
     }
 
     #[test]
@@ -4766,9 +4842,11 @@ mod tests {
         std::fs::create_dir_all(&assets_dir).expect("create assets dir");
         std::fs::write(assets_dir.join("world.glb"), make_multi_node_scene_glb())
             .expect("write world scene");
+        write_required_art_assets(&package_dir);
         std::fs::write(
             package_dir.join(PACKAGE_MANIFEST_NAME),
-            r#"{
+            manifest_with_required_art(
+                r#"{
                 "name":"Scene Metadata Test",
                 "abi_version":3,
                 "scene_space":"world_3d",
@@ -4784,6 +4862,7 @@ mod tests {
                     ]
                 }
             }"#,
+            ),
         )
         .expect("write manifest");
         let manifest =
@@ -5133,7 +5212,12 @@ mod tests {
         }"#;
         let wasm = b"fresh-slide-wasm";
         let sidecar = b"fresh-sidecar-wasm";
-        std::fs::write(built_dir.join(PACKAGE_MANIFEST_NAME), manifest).expect("write manifest");
+        write_required_art_assets(&package_dir);
+        std::fs::write(
+            built_dir.join(PACKAGE_MANIFEST_NAME),
+            manifest_with_required_art(manifest),
+        )
+        .expect("write manifest");
         std::fs::write(built_dir.join(PACKAGE_WASM_NAME), wasm).expect("write wasm");
         std::fs::write(built_dir.join(PACKAGE_SIDECAR_NAME), sidecar).expect("write sidecar");
 
@@ -5188,7 +5272,12 @@ cp built/sidecar.wasm sidecar.wasm
             "scene_space":"screen_2d"
         }"#;
         let wasm = b"relative-slide-wasm";
-        std::fs::write(built_dir.join(PACKAGE_MANIFEST_NAME), manifest).expect("write manifest");
+        write_required_art_assets(&package_dir);
+        std::fs::write(
+            built_dir.join(PACKAGE_MANIFEST_NAME),
+            manifest_with_required_art(manifest),
+        )
+        .expect("write manifest");
         std::fs::write(built_dir.join(PACKAGE_WASM_NAME), wasm).expect("write wasm");
 
         let build_script = r#"#!/usr/bin/env bash
@@ -5257,6 +5346,9 @@ cp built/slide.wasm slide.wasm
             })
             .collect();
         assert!(names.iter().any(|name| name == "assets/kart.glb"));
+        assert!(names.iter().any(|name| name == "art/j-card.png"));
+        assert!(names.iter().any(|name| name == "art/side-a.png"));
+        assert!(names.iter().any(|name| name == "art/side-b.png"));
 
         let (dir_loaded, _) =
             load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
@@ -5343,6 +5435,7 @@ cp built/slide.wasm slide.wasm
             abi_version: Some(2),
             scene_space: None,
             assets: Some(vzglyd_kernel::manifest::ManifestAssets {
+                art: None,
                 textures: vec![],
                 meshes: vec![],
                 scenes: vec![],
@@ -5396,6 +5489,7 @@ cp built/slide.wasm slide.wasm
             abi_version: Some(2),
             scene_space: None,
             assets: Some(vzglyd_kernel::manifest::ManifestAssets {
+                art: None,
                 textures: vec![],
                 meshes: vec![],
                 scenes: vec![],
@@ -5436,6 +5530,7 @@ cp built/slide.wasm slide.wasm
             abi_version: Some(2),
             scene_space: None,
             assets: Some(vzglyd_kernel::manifest::ManifestAssets {
+                art: None,
                 textures: vec![],
                 meshes: vec![],
                 scenes: vec![],
@@ -5474,6 +5569,7 @@ cp built/slide.wasm slide.wasm
             abi_version: Some(2),
             scene_space: None,
             assets: Some(vzglyd_kernel::manifest::ManifestAssets {
+                art: None,
                 textures: vec![],
                 meshes: vec![],
                 scenes: vec![],
@@ -5508,6 +5604,7 @@ cp built/slide.wasm slide.wasm
             abi_version: Some(2),
             scene_space: None,
             assets: Some(vzglyd_kernel::manifest::ManifestAssets {
+                art: None,
                 textures: vec![],
                 meshes: vec![],
                 scenes: vec![],
@@ -5548,6 +5645,7 @@ cp built/slide.wasm slide.wasm
             abi_version: Some(2),
             scene_space: None,
             assets: Some(vzglyd_kernel::manifest::ManifestAssets {
+                art: None,
                 textures: vec![],
                 meshes: vec![],
                 scenes: vec![],
@@ -5596,6 +5694,7 @@ cp built/slide.wasm slide.wasm
             abi_version: Some(2),
             scene_space: None,
             assets: Some(vzglyd_kernel::manifest::ManifestAssets {
+                art: None,
                 textures: vec![],
                 meshes: vec![],
                 scenes: vec![],
@@ -5646,8 +5745,12 @@ cp built/slide.wasm slide.wasm
             }
         }"#;
 
-        std::fs::write(package_dir.join(PACKAGE_MANIFEST_NAME), manifest_json)
-            .expect("write manifest");
+        write_required_art_assets(&package_dir);
+        std::fs::write(
+            package_dir.join(PACKAGE_MANIFEST_NAME),
+            manifest_with_required_art(manifest_json),
+        )
+        .expect("write manifest");
         std::fs::write(package_dir.join(PACKAGE_WASM_NAME), &wasm).expect("write wasm");
 
         let (loaded, _manifest) = load_slide_from_wasm::<WorldVertex>(
@@ -5688,8 +5791,12 @@ cp built/slide.wasm slide.wasm
             }
         }"#;
 
-        std::fs::write(package_dir.join(PACKAGE_MANIFEST_NAME), manifest_json)
-            .expect("write manifest");
+        write_required_art_assets(&package_dir);
+        std::fs::write(
+            package_dir.join(PACKAGE_MANIFEST_NAME),
+            manifest_with_required_art(manifest_json),
+        )
+        .expect("write manifest");
         std::fs::write(package_dir.join(PACKAGE_WASM_NAME), &wasm).expect("write wasm");
 
         let (loaded, _manifest) = load_slide_from_wasm::<WorldVertex>(

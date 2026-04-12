@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 220" role="img" aria-label="Loading side A">
+  <rect width="720" height="220" rx="28" fill="#f4d35e"/>
+  <rect x="38" y="36" width="644" height="148" rx="18" fill="#101820"/>
+  <text x="72" y="128" fill="#f7fff7" font-family="monospace" font-size="54" font-weight="700">SIDE A / LOAD</text>
+</svg>

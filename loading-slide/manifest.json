@@ -4,6 +4,11 @@
   "author": "LUME",
   "description": "Loading screen slide compiled from Rust to wasm32-wasip1",
   "assets": {
+    "art": {
+      "j_card": { "path": "art/j-card.svg", "label": "Loading J-card" },
+      "side_a_label": { "path": "art/side-a.svg", "label": "Loading side A" },
+      "side_b_label": { "path": "art/side-b.svg", "label": "Loading side B" }
+    },
     "scenes": [
       {
         "path": "assets/world.glb",

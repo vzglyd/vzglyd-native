@@ -1,5 +1,6 @@
 //! Axum route handlers for the management HTTP server.
 
+use std::io::Read;
 use std::path::Path;
 
 use axum::Json;
@@ -336,6 +337,51 @@ pub async fn get_slide_bundle(
     }
 }
 
+/// GET /api/slides/:path/art/:kind — serve declared cassette artwork from a bundle.
+pub async fn get_slide_art(
+    State(state): State<ServerState>,
+    AxumPath((bundle_path, kind)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    if let Err(e) = validate_bundle_path(&bundle_path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate_art_kind(&kind) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+
+    let full_path = state.slides_dir.join(&bundle_path);
+    let result = tokio::task::spawn_blocking(move || {
+        extract_art_from_archive(&full_path, &kind)
+    })
+    .await;
+
+    match result {
+        Ok(Ok((content_type, bytes))) => Response::builder()
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap()
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("task error: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 // ── Secrets routes ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -479,6 +525,13 @@ fn validate_bundle_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_art_kind(kind: &str) -> Result<(), String> {
+    match kind {
+        "j-card" | "side-a" | "side-b" => Ok(()),
+        _ => Err("art kind must be one of: j-card, side-a, side-b".into()),
+    }
+}
+
 /// Extract and parse `manifest.json` from a `.vzglyd` ZIP archive.
 fn extract_manifest_from_archive(path: &std::path::Path) -> Result<SlideManifest, String> {
     let file = std::fs::File::open(path)
@@ -505,9 +558,154 @@ fn extract_manifest_from_archive(path: &std::path::Path) -> Result<SlideManifest
 
     let mut entry = zip.by_index(idx).map_err(|e| format!("read manifest entry: {e}"))?;
     let mut content = String::new();
-    std::io::Read::read_to_string(&mut entry, &mut content)
+    entry
+        .read_to_string(&mut content)
         .map_err(|e| format!("read manifest content: {e}"))?;
 
-    vzglyd_kernel::manifest::parse_manifest(content.as_bytes())
-        .map_err(|e| format!("parse manifest: {e}"))
+    let manifest = vzglyd_kernel::manifest::parse_manifest(content.as_bytes())
+        .map_err(|e| format!("parse manifest: {e}"))?;
+    manifest
+        .validate(crate::slide_loader::ABI_VERSION)
+        .map_err(|e| format!("validate manifest: {e}"))?;
+    Ok(manifest)
+}
+
+fn extract_art_from_archive(path: &Path, kind: &str) -> Result<(&'static str, Vec<u8>), String> {
+    let manifest = extract_manifest_from_archive(path)?;
+    let art_path = cassette_art_path(&manifest, kind)?;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("open '{}': {e}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| format!("read zip '{}': {e}", path.display()))?;
+    let mut entry = zip.by_name(art_path).map_err(|e| {
+        format!(
+            "art asset '{art_path}' not found in '{}': {e}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read art asset '{art_path}': {e}"))?;
+    Ok((image_content_type(art_path), bytes))
+}
+
+fn cassette_art_path<'a>(manifest: &'a SlideManifest, kind: &str) -> Result<&'a str, String> {
+    let art = manifest
+        .assets
+        .as_ref()
+        .and_then(|assets| assets.art.as_ref())
+        .ok_or_else(|| "manifest.assets.art is required".to_string())?;
+    let path = match kind {
+        "j-card" => &art.j_card.path,
+        "side-a" => &art.side_a_label.path,
+        "side-b" => &art.side_b_label.path,
+        _ => return Err("art kind must be one of: j-card, side-a, side-b".into()),
+    };
+    Ok(path)
+}
+
+fn image_content_type(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    fn temp_archive_path(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "vzglyd_routes_{label}_{}_{}.vzglyd",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    fn write_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).expect("create test archive");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, bytes) in entries {
+            zip.start_file(*name, options).expect("start zip entry");
+            zip.write_all(bytes).expect("write zip entry");
+        }
+        zip.finish().expect("finish zip");
+    }
+
+    fn manifest_with_art() -> Vec<u8> {
+        br#"{
+            "name":"Art Test",
+            "abi_version":3,
+            "scene_space":"screen_2d",
+            "assets":{
+                "art":{
+                    "j_card":{"path":"art/j-card.png"},
+                    "side_a_label":{"path":"art/side-a.png"},
+                    "side_b_label":{"path":"art/side-b.png"}
+                }
+            }
+        }"#
+        .to_vec()
+    }
+
+    #[test]
+    fn extract_art_from_archive_reads_manifest_declared_asset() {
+        let archive_path = temp_archive_path("art_ok");
+        let manifest = manifest_with_art();
+        write_archive(
+            &archive_path,
+            &[
+                ("manifest.json", manifest.as_slice()),
+                ("art/j-card.png", b"cover"),
+                ("art/side-a.png", b"side-a"),
+                ("art/side-b.png", b"side-b"),
+            ],
+        );
+
+        let (content_type, bytes) =
+            extract_art_from_archive(&archive_path, "side-a").expect("extract side A art");
+        assert_eq!(content_type, "image/png");
+        assert_eq!(bytes, b"side-a");
+
+        let _ = std::fs::remove_file(archive_path);
+    }
+
+    #[test]
+    fn extract_manifest_from_archive_rejects_missing_cassette_art() {
+        let archive_path = temp_archive_path("missing_art");
+        write_archive(
+            &archive_path,
+            &[(
+                "manifest.json",
+                br#"{"name":"Old Bundle","abi_version":3,"scene_space":"screen_2d"}"#,
+            )],
+        );
+
+        let error =
+            extract_manifest_from_archive(&archive_path).expect_err("missing art should fail");
+        assert!(error.contains("manifest.assets.art is required"));
+
+        let _ = std::fs::remove_file(archive_path);
+    }
 }

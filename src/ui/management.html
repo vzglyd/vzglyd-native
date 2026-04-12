@@ -140,6 +140,57 @@ textarea { resize: vertical; min-height: 80px; }
   border: 1px solid rgba(102,195,255,0.2);
 }
 
+/* ── Cassette artwork ── */
+.cassette-art {
+  display: grid; grid-template-columns: minmax(0,1.05fr) minmax(170px,0.95fr);
+  gap: 0.75rem; margin: 0.65rem 0;
+}
+.cassette-art.is-compact {
+  grid-template-columns: 74px 1fr; gap: 0.55rem; margin: 0;
+  align-items: center;
+}
+.cassette-j-card, .cassette-tape {
+  border: 1px solid rgba(255,208,122,0.24);
+  background: rgba(255,208,122,0.07);
+  border-radius: 8px; overflow: hidden;
+}
+.cassette-j-card {
+  aspect-ratio: 1 / 1; position: relative;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.2);
+}
+.cassette-art.is-compact .cassette-j-card { width: 74px; height: 74px; }
+.cassette-j-card img, .cassette-label img {
+  width: 100%; height: 100%; display: block; object-fit: cover;
+}
+.cassette-caption, .cassette-label-title {
+  position: absolute; left: 0.45rem; bottom: 0.35rem;
+  background: rgba(3,8,15,0.76); color: var(--accent-warm);
+  border: 1px solid rgba(255,208,122,0.22);
+  border-radius: 6px; padding: 0.12rem 0.4rem;
+  font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+}
+.cassette-tape {
+  display: grid; gap: 0.5rem; padding: 0.55rem;
+  background:
+    linear-gradient(90deg, transparent 0 18%, rgba(255,255,255,0.08) 18% 22%, transparent 22% 78%, rgba(255,255,255,0.08) 78% 82%, transparent 82%),
+    rgba(4,10,17,0.72);
+}
+.cassette-label {
+  position: relative; min-height: 72px; border-radius: 7px;
+  border: 1px solid rgba(237,245,255,0.18);
+  background: rgba(237,245,255,0.06); overflow: hidden;
+}
+.cassette-art.is-compact .cassette-label { min-height: 34px; }
+.cassette-art.is-compact .cassette-caption,
+.cassette-art.is-compact .cassette-label-title { display: none; }
+.library-row {
+  display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 0.75rem;
+  align-items: center; padding: 0.6rem 0; border-bottom: 1px solid var(--border);
+}
+.library-info { min-width: 0; }
+.library-name { display: block; font-weight: 600; overflow-wrap: anywhere; }
+.library-path { display: block; font-size: 0.78rem; color: var(--text-dim); overflow-wrap: anywhere; }
+
 /* ── Entry params ── */
 .entry-params-shell { margin-top: 0.6rem; padding-top: 0.6rem;
   border-top: 1px solid var(--border); }
@@ -608,6 +659,69 @@ function createNote(text, tone = '') {
   return p;
 }
 
+function cassetteArtUrl(bundlePath, kind) {
+  return `/api/slides/${encodeURIComponent(bundlePath)}/art/${kind}`;
+}
+
+function hasCassetteArt(manifest) {
+  return Boolean(
+    manifest?.assets?.art?.j_card?.path &&
+    manifest?.assets?.art?.side_a_label?.path &&
+    manifest?.assets?.art?.side_b_label?.path,
+  );
+}
+
+function createCassetteImage(bundlePath, kind, label) {
+  const img = document.createElement('img');
+  img.src = cassetteArtUrl(bundlePath, kind);
+  img.alt = label;
+  img.loading = 'lazy';
+  img.addEventListener('error', () => {
+    img.replaceWith(createNote(`${label} unavailable`, 'error'));
+  }, { once: true });
+  return img;
+}
+
+function createCassetteCaption(text, className) {
+  const caption = document.createElement('span');
+  caption.className = className;
+  caption.textContent = text;
+  return caption;
+}
+
+function buildCassetteArt(bundlePath, manifest, { compact = false } = {}) {
+  if (!bundlePath || !hasCassetteArt(manifest)) return null;
+
+  const shell = document.createElement('div');
+  shell.className = `cassette-art${compact ? ' is-compact' : ''}`;
+
+  const cover = document.createElement('div');
+  cover.className = 'cassette-j-card';
+  cover.append(
+    createCassetteImage(bundlePath, 'j-card', `${manifest.name ?? bundlePath} J-card`),
+    createCassetteCaption('J-card', 'cassette-caption'),
+  );
+
+  const tape = document.createElement('div');
+  tape.className = 'cassette-tape';
+  const sideA = document.createElement('div');
+  sideA.className = 'cassette-label';
+  sideA.append(
+    createCassetteImage(bundlePath, 'side-a', `${manifest.name ?? bundlePath} side A label`),
+    createCassetteCaption('Side A', 'cassette-label-title'),
+  );
+  const sideB = document.createElement('div');
+  sideB.className = 'cassette-label';
+  sideB.append(
+    createCassetteImage(bundlePath, 'side-b', `${manifest.name ?? bundlePath} side B label`),
+    createCassetteCaption('Side B', 'cassette-label-title'),
+  );
+  tape.append(sideA, sideB);
+
+  shell.append(cover, tape);
+  return shell;
+}
+
 function describeInherited(entry, key) {
   const own = entry[key];
   const def = state.editablePlaylist?.defaults?.[key] ?? '';
@@ -627,6 +741,7 @@ function buildManifestBadges(entry) {
   if (m.author) badges.push(`by ${m.author}`);
   if (m.scene_space) badges.push(m.scene_space);
   if (m.display?.duration_seconds != null) badges.push(`${m.display.duration_seconds}s`);
+  if (hasCassetteArt(m)) badges.push('cassette art');
   if (m.params?.fields?.length) badges.push(`${m.params.fields.length} params`);
   return badges;
 }
@@ -675,7 +790,7 @@ function renderEntries() {
     summary.className = 'entry-summary';
     const title = document.createElement('div');
     title.className = 'entry-summary-title';
-    title.textContent = entry.bundle_manifest?.name ?? entry.path || 'New slide';
+    title.textContent = (entry.bundle_manifest?.name ?? entry.path) || 'New slide';
     summary.append(title);
     const badges = buildManifestBadges(entry);
     if (badges.length) {
@@ -690,6 +805,8 @@ function renderEntries() {
     }
     if (entry.bundle_manifest_status === 'error')
       summary.append(createNote(`Metadata unavailable: ${entry.bundle_error}`, 'error'));
+    const artPanel = buildCassetteArt(entry.path, entry.bundle_manifest);
+    if (artPanel) summary.append(artPanel);
 
     // Fields grid
     const grid = document.createElement('div');
@@ -817,16 +934,20 @@ function renderLibrary() {
   }
   for (const bundle of state.library) {
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:0.5rem;padding:0.35rem 0;border-bottom:1px solid var(--border)';
+    row.className = 'library-row';
 
     const info = document.createElement('div');
+    info.className = 'library-info';
     const name = document.createElement('span');
-    name.style.fontWeight = '600';
+    name.className = 'library-name';
     name.textContent = bundle.manifest?.name ?? bundle.path;
     const meta = document.createElement('span');
-    meta.style.cssText = 'font-size:0.78rem;color:var(--text-dim);margin-left:0.5rem';
+    meta.className = 'library-path';
     meta.textContent = bundle.path;
     info.append(name, meta);
+    const artPanel = buildCassetteArt(bundle.path, bundle.manifest, { compact: true });
+    if (artPanel) info.append(artPanel);
+    else if (!bundle.manifest) info.append(createNote('Cassette artwork unavailable.', 'error'));
 
     const addBtn = document.createElement('button');
     addBtn.className = 'secondary-btn';

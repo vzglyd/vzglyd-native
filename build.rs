@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::Write as _,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -13,6 +13,7 @@ fn main() {
     // Rebuild whenever loading-slide source or assets change.
     println!("cargo:rerun-if-changed=loading-slide/src");
     println!("cargo:rerun-if-changed=loading-slide/assets");
+    println!("cargo:rerun-if-changed=loading-slide/art");
     println!("cargo:rerun-if-changed=loading-slide/manifest.json");
     println!("cargo:rerun-if-changed=loading-slide/Cargo.toml");
 
@@ -75,19 +76,30 @@ fn pack_vzglyd(
     zip.start_file("slide.wasm", stored)?;
     zip.write_all(&fs::read(wasm)?)?;
 
-    // assets/
-    let assets_dir = slide_dir.join("assets");
-    if assets_dir.is_dir() {
-        for entry in fs::read_dir(&assets_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let name = entry.file_name();
-                zip.start_file(format!("assets/{}", name.to_string_lossy()), stored)?;
-                zip.write_all(&fs::read(entry.path())?)?;
-            }
-        }
-    }
+    pack_child_dir(&mut zip, stored, slide_dir, "assets")?;
+    pack_child_dir(&mut zip, stored, slide_dir, "art")?;
 
     zip.finish()?;
+    Ok(())
+}
+
+fn pack_child_dir<W: Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    options: zip::write::SimpleFileOptions,
+    slide_dir: &Path,
+    child: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = slide_dir.join(child);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let name = entry.file_name();
+            zip.start_file(format!("{child}/{}", name.to_string_lossy()), options)?;
+            zip.write_all(&fs::read(entry.path())?)?;
+        }
+    }
     Ok(())
 }

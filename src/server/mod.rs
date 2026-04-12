@@ -100,6 +100,10 @@ pub fn start_server(
                         "/api/slides/:path/bundle",
                         get(routes::get_slide_bundle),
                     )
+                    .route(
+                        "/api/slides/:path/art/:kind",
+                        get(routes::get_slide_art),
+                    )
                     // Secrets
                     .route("/api/secrets", get(routes::get_secrets))
                     .route("/api/secrets", post(routes::post_secrets))

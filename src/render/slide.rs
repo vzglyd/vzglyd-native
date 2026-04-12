@@ -347,6 +347,12 @@ impl ScreenSlideRenderer {
         }
     }
 
+    pub fn last_network_request_unix_secs(&self) -> Option<u64> {
+        self.runtime
+            .as_ref()
+            .and_then(slide_loader::SlideRuntime::last_network_request_unix_secs)
+    }
+
     /// Updates the slide and returns whether it changed.
     pub fn update(&mut self, ctx: &GpuContext, dt: f32) -> bool {
         let _trace = active_trace_recorder().map(|recorder| {
@@ -632,6 +638,12 @@ impl WorldSlideRenderer {
         }
     }
 
+    pub fn last_network_request_unix_secs(&self) -> Option<u64> {
+        self.runtime
+            .as_ref()
+            .and_then(slide_loader::SlideRuntime::last_network_request_unix_secs)
+    }
+
     pub fn set_elapsed(&mut self, elapsed: f32) {
         self.elapsed = elapsed;
     }
@@ -879,6 +891,13 @@ impl SlideRenderer {
         match self {
             SlideRenderer::Screen(screen) => screen.set_active(active),
             SlideRenderer::World(world) => world.set_active(active),
+        }
+    }
+
+    pub fn last_network_request_unix_secs(&self) -> Option<u64> {
+        match self {
+            SlideRenderer::Screen(screen) => screen.last_network_request_unix_secs(),
+            SlideRenderer::World(world) => world.last_network_request_unix_secs(),
         }
     }
 
@@ -2213,4 +2232,3 @@ mod animation_tests {
         assert!((matrices[0].w_axis.y - 2.5).abs() < 0.1);
     }
 }
-
