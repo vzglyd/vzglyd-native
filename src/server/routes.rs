@@ -21,11 +21,6 @@ use super::state::ServerState;
 // ── Embedded static assets ────────────────────────────────────────────────────
 
 const MANAGEMENT_HTML: &str = include_str!("../ui/management.html");
-const VZGLYD_WEB_WASM: &[u8] =
-    include_bytes!("../../../VRX-64-web/web-preview/pkg/vzglyd_web_bg.wasm");
-const VZGLYD_WEB_JS: &str = include_str!("../../../VRX-64-web/web-preview/pkg/vzglyd_web.js");
-const VZGLYD_WEB_BG_JS: &str =
-    include_str!("../../../VRX-64-web/web-preview/pkg/vzglyd_web_bg.js");
 
 // ── Static asset routes ───────────────────────────────────────────────────────
 
@@ -34,30 +29,6 @@ pub async fn get_index() -> impl IntoResponse {
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(MANAGEMENT_HTML))
-        .unwrap()
-}
-
-/// Serve the vzglyd_web WASM binary.
-pub async fn get_vzglyd_wasm() -> impl IntoResponse {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/wasm")
-        .body(Body::from(VZGLYD_WEB_WASM))
-        .unwrap()
-}
-
-/// Serve the vzglyd_web JS glue.
-pub async fn get_vzglyd_js() -> impl IntoResponse {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
-        .body(Body::from(VZGLYD_WEB_JS))
-        .unwrap()
-}
-
-/// Serve the vzglyd_web background JS glue.
-pub async fn get_vzglyd_bg_js() -> impl IntoResponse {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
-        .body(Body::from(VZGLYD_WEB_BG_JS))
         .unwrap()
 }
 

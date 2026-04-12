@@ -74,18 +74,6 @@ pub fn start_server(
                 let app = Router::new()
                     // Static assets
                     .route("/", get(routes::get_index))
-                    .route(
-                        "/assets/pkg/vzglyd_web_bg.wasm",
-                        get(routes::get_vzglyd_wasm),
-                    )
-                    .route(
-                        "/assets/pkg/vzglyd_web.js",
-                        get(routes::get_vzglyd_js),
-                    )
-                    .route(
-                        "/assets/pkg/vzglyd_web_bg.js",
-                        get(routes::get_vzglyd_bg_js),
-                    )
                     // Playlist
                     .route("/api/playlist", get(routes::get_playlist))
                     .route("/api/playlist", post(routes::post_playlist))

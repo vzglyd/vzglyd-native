@@ -64,11 +64,6 @@ body {
   gap: 0.75rem;
 }
 #preview-label { font-size: 0.8rem; color: var(--text-dim); }
-#view-canvas {
-  width: 640px; max-width: 100%; aspect-ratio: 640/480;
-  border: 1px solid var(--border); border-radius: 8px;
-  background: #000;
-}
 #preview-status { font-size: 0.8rem; color: var(--text-dim); }
 
 /* ── Panels ── */
@@ -329,10 +324,16 @@ textarea { resize: vertical; min-height: 80px; }
 
   </div>
 
-  <!-- Right panel: preview -->
+  <!-- Right panel: preview placeholder -->
   <div id="right-panel">
     <p id="preview-label">Select a slide to preview</p>
-    <canvas id="view-canvas" width="640" height="480"></canvas>
+    <div id="preview-placeholder" style="
+      width: 640px; max-width: 100%; aspect-ratio: 640/480;
+      display: flex; align-items: center; justify-content: center;
+      border: 1px solid var(--border); border-radius: 8px;
+      background: var(--surface); color: var(--text-dim);
+      font-size: 0.9rem; text-align: center; padding: 1rem;
+    ">Live preview requires<br/>the VRX-64-web build</div>
     <p id="preview-status"></p>
   </div>
 </div>
@@ -534,8 +535,6 @@ const state = {
   secretKeys: [],
   library: [],
   selectedIndex: null,
-  previewHost: null,
-  previewLoading: false,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -560,7 +559,6 @@ const newSecretValue = document.getElementById('new-secret-value');
 const addSecretBtn = document.getElementById('add-secret-btn');
 const exportSecretsBtn = document.getElementById('export-secrets-btn');
 const previewLabel = document.getElementById('preview-label');
-const viewCanvas = document.getElementById('view-canvas');
 const previewStatus = document.getElementById('preview-status');
 const toast = document.getElementById('toast');
 
@@ -1048,25 +1046,10 @@ function exportSecrets() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// WebGPU Preview
+// WebGPU Preview (requires vzglyd_web built separately — not embedded in native)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-let vzglydWebModule = null;
-
-async function loadVzglydWebModule() {
-  if (vzglydWebModule) return vzglydWebModule;
-  try {
-    // vzglyd_web.js uses global `import.meta` — load it as a module script.
-    // The bg wasm is fetched by the JS glue from /assets/pkg/vzglyd_web_bg.wasm.
-    vzglydWebModule = await import('/assets/pkg/vzglyd_web.js');
-    await vzglydWebModule.default();  // initialises the WASM module
-    return vzglydWebModule;
-  } catch (e) {
-    throw new Error(`Failed to load preview player: ${e.message}`);
-  }
-}
-
-async function previewSlide(index) {
+function previewSlide(index) {
   state.selectedIndex = index;
   renderEntries();
 
@@ -1074,54 +1057,7 @@ async function previewSlide(index) {
   if (!entry?.path) return;
 
   previewLabel.textContent = `Preview: ${entry.bundle_manifest?.name ?? entry.path}`;
-  previewStatus.textContent = 'Loading…';
-
-  if (state.previewHost) {
-    state.previewHost.teardown();
-    state.previewHost = null;
-  }
-
-  try {
-    // Check WebGPU availability.
-    if (!navigator.gpu) {
-      previewStatus.textContent = 'WebGPU not available in this browser.';
-      return;
-    }
-
-    const mod = await loadVzglydWebModule();
-    const host = new mod.WebHost(viewCanvas, null);
-    state.previewHost = host;
-
-    // Fetch the bundle bytes.
-    const resp = await fetch(`/api/slides/${encodeURIComponent(entry.path)}/bundle`);
-    if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
-    const bytes = new Uint8Array(await resp.arrayBuffer());
-
-    // Parse params.
-    let paramsJson = null;
-    try { paramsJson = parseParamsText(entry.params_text); } catch { /* ignore */ }
-
-    await host.loadBundle(bytes, paramsJson ? { params: paramsJson } : null);
-    previewStatus.textContent = '';
-
-    // Frame loop.
-    let rafId = null;
-    function tick(ts) {
-      if (!state.previewHost || state.previewHost !== host) return;
-      try { host.frame(ts); } catch { return; }
-      rafId = requestAnimationFrame(tick);
-    }
-    rafId = requestAnimationFrame(tick);
-
-    // Clean up on next preview.
-    const origTeardown = host.teardown.bind(host);
-    host.teardown = () => {
-      if (rafId !== null) cancelAnimationFrame(rafId);
-      origTeardown();
-    };
-  } catch (e) {
-    previewStatus.textContent = `Preview error: ${e.message}`;
-  }
+  previewStatus.textContent = 'Preview requires the web build. Run wasm-pack in VRX-64-web and rebuild.';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
