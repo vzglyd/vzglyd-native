@@ -1567,6 +1567,11 @@ impl AssetLoader {
             )),
         })?;
         let fallback = template.vertices.first();
+        let indices_u32 = imported.indices;
+        let indices: Vec<u16> = indices_u32
+            .into_iter()
+            .map(|idx| u16::try_from(idx).expect("static mesh index exceeds u16"))
+            .collect();
         Ok(StaticMesh {
             label: template.label.clone(),
             vertices: imported
@@ -1574,7 +1579,7 @@ impl AssetLoader {
                 .into_iter()
                 .map(|vertex| V::from_imported(vertex, fallback))
                 .collect(),
-            indices: imported.indices,
+            indices,
         })
     }
 
@@ -1973,6 +1978,12 @@ where
         let material_class = resolve_scene_material_class(mesh_node);
         let pipeline = resolve_scene_pipeline(&scene.id, mesh_node, material_class);
         let mesh_index = static_meshes.len();
+        let indices: Vec<u16> = mesh_node
+            .indices
+            .iter()
+            .map(|&idx| u16::try_from(idx).expect("scene mesh index exceeds u16"))
+            .collect();
+        let index_count = indices.len() as u32;
         static_meshes.push(StaticMesh {
             label: mesh_node.label.clone(),
             vertices: mesh_node
@@ -1981,13 +1992,13 @@ where
                 .copied()
                 .map(|imported| V::from_scene_import(imported, material_class, fallback_vertex))
                 .collect(),
-            indices: mesh_node.indices.clone(),
+            indices,
         });
         let draw = DrawSpec {
             label: mesh_node.label.clone(),
             source: DrawSource::Static(mesh_index),
             pipeline,
-            index_range: 0..mesh_node.indices.len() as u32,
+            index_range: 0..index_count,
         };
         match pipeline {
             PipelineKind::Opaque => opaque_draws.push(draw),
@@ -2169,6 +2180,14 @@ fn maybe_compile_screen_background_scene(
 }
 
 fn encode_mesh_asset(imported: &ImportedMesh) -> Result<Vec<u8>, LoadError> {
+    let indices: Vec<u16> = imported
+        .indices
+        .iter()
+        .map(|&idx| {
+            u16::try_from(idx)
+                .expect("host mesh asset index exceeds u16 range")
+        })
+        .collect();
     postcard::to_stdvec(&MeshAsset {
         vertices: imported
             .vertices
@@ -2180,7 +2199,7 @@ fn encode_mesh_asset(imported: &ImportedMesh) -> Result<Vec<u8>, LoadError> {
                 color: vertex.color.unwrap_or([1.0, 1.0, 1.0, 1.0]),
             })
             .collect(),
-        indices: imported.indices.clone(),
+        indices,
     })
     .map_err(|error| LoadError::AssetLoad(format!("failed to encode mesh asset: {error}")))
 }

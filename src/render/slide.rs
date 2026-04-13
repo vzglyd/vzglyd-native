@@ -471,7 +471,7 @@ impl ScreenSlideRenderer {
                                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                 pass.set_index_buffer(
                                     mesh.index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint16,
+                                    wgpu::IndexFormat::Uint32,
                                 );
                                 pass.draw_indexed(draw.index_range.start..draw_range_end, 0, 0..1);
                             }
@@ -772,7 +772,7 @@ impl WorldSlideRenderer {
                                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                     pass.set_index_buffer(
                                         mesh.index_buffer.slice(..),
-                                        wgpu::IndexFormat::Uint16,
+                                        wgpu::IndexFormat::Uint32,
                                     );
                                     pass.draw_indexed(
                                         draw.index_range.start..draw_range_end,
@@ -801,7 +801,7 @@ impl WorldSlideRenderer {
                                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                     pass.set_index_buffer(
                                         mesh.index_buffer.slice(..),
-                                        wgpu::IndexFormat::Uint16,
+                                        wgpu::IndexFormat::Uint32,
                                     );
                                     pass.draw_indexed(
                                         draw.index_range.start
@@ -1074,11 +1074,11 @@ fn create_static_mesh_buffers<V: Pod>(device: &wgpu::Device, mesh: &StaticMesh<V
 
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("static_index_buffer"),
-        size: mesh.indices.len() as u64 * 2,
+        size: mesh.indices.len() as u64 * 4,
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    index_buffer.slice(..).get_mapped_range_mut()[..mesh.indices.len() * 2]
+    index_buffer.slice(..).get_mapped_range_mut()[..mesh.indices.len() * 4]
         .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
     index_buffer.unmap();
 
@@ -1106,11 +1106,11 @@ fn create_dynamic_mesh_buffers(
 
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dynamic_index_buffer"),
-        size: index_capacity as u64 * 2,
+        size: index_capacity as u64 * 4,
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    index_buffer.slice(..).get_mapped_range_mut()[..mesh.indices.len() * 2]
+    index_buffer.slice(..).get_mapped_range_mut()[..mesh.indices.len() * 4]
         .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
     index_buffer.unmap();
 
