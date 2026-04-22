@@ -68,7 +68,8 @@ fn make_mp3_bytes() -> Vec<u8> {
 
 /// Create a temporary directory for test assets.
 fn temp_test_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("vzglyd_audio_test_{label}_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("vzglyd_audio_test_{label}_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp test dir");
     dir
@@ -81,7 +82,9 @@ fn temp_test_dir(label: &str) -> PathBuf {
 fn engine_plays_valid_wav() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let wav = make_wav_bytes();
-    let handle = engine.play(&wav, 0.5, false).expect("WAV playback should succeed");
+    let handle = engine
+        .play(&wav, 0.5, false)
+        .expect("WAV playback should succeed");
     handle.stop();
 }
 
@@ -130,7 +133,9 @@ fn engine_rejects_empty_data() {
 fn engine_plays_looped_sound() {
     let engine = AudioEngine::global().expect("audio engine should be available");
     let wav = make_wav_bytes();
-    let handle = engine.play(&wav, 0.3, true).expect("looped playback should succeed");
+    let handle = engine
+        .play(&wav, 0.3, true)
+        .expect("looped playback should succeed");
     std::thread::sleep(std::time::Duration::from_millis(50));
     handle.stop();
 }
@@ -143,7 +148,9 @@ fn engine_volume_set_at_play_time() {
 
     // Test various volume levels
     for volume in [0.0, 0.25, 0.5, 0.75, 1.0] {
-        let handle = engine.play(&wav, volume, false).expect("play at volume {volume}");
+        let handle = engine
+            .play(&wav, volume, false)
+            .expect("play at volume {volume}");
         handle.stop();
     }
 }
@@ -252,7 +259,10 @@ fn registry_stop_nonexistent_returns_error() {
 fn registry_operations_on_nonexistent_ids() {
     let mut registry = SoundRegistry::new();
 
-    assert!(matches!(registry.set_volume(42, 0.5), Err(AudioError::NotFound(42))));
+    assert!(matches!(
+        registry.set_volume(42, 0.5),
+        Err(AudioError::NotFound(42))
+    ));
     assert!(matches!(registry.pause(42), Err(AudioError::NotFound(42))));
     assert!(matches!(registry.resume(42), Err(AudioError::NotFound(42))));
 }
@@ -299,7 +309,9 @@ fn catalog_loads_wav_from_disk() {
 
     // Verify it decodes through rodio
     let engine = AudioEngine::global().expect("audio engine available");
-    let handle = engine.play(&data, 0.5, false).expect("decoded WAV should play");
+    let handle = engine
+        .play(&data, 0.5, false)
+        .expect("decoded WAV should play");
     handle.stop();
 
     // Cleanup

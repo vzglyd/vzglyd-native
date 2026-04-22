@@ -125,13 +125,13 @@ impl OverlayRenderer {
             .device
             .create_shader_module(wgpu::include_wgsl!("../../shaders/overlay.wgsl"));
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("overlay_pipeline_layout"),
-                    bind_group_layouts: &[&bgl],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("overlay_pipeline_layout"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[],
+            });
 
         let vertex_stride = std::mem::size_of::<OverlayVertex>() as u64;
         let pipeline = ctx
@@ -239,15 +239,14 @@ impl OverlayRenderer {
         let clock_str = Local::now().format("%H:%M:%S").to_string();
         let (vp_x, vp_y, sw, sh) = blit_rect;
 
-        let (vertices, indices): (Vec<OverlayVertex>, Vec<u16>) =
-            build_hud_geometry_with_update(
-                &self.glyph_map,
-                sw,
-                sh,
-                slide_name,
-                &clock_str,
-                updated_str,
-            );
+        let (vertices, indices): (Vec<OverlayVertex>, Vec<u16>) = build_hud_geometry_with_update(
+            &self.glyph_map,
+            sw,
+            sh,
+            slide_name,
+            &clock_str,
+            updated_str,
+        );
 
         if vertices.len() > self.vertex_capacity {
             self.vertex_capacity = vertices.len().next_power_of_two();
@@ -340,8 +339,10 @@ impl OverlayRenderer {
             }));
         }
 
-        ctx.queue.write_buffer(&self.vertex_buffer, 0, cast_slice(&vertices));
-        ctx.queue.write_buffer(&self.index_buffer, 0, cast_slice(&indices));
+        ctx.queue
+            .write_buffer(&self.vertex_buffer, 0, cast_slice(&vertices));
+        ctx.queue
+            .write_buffer(&self.index_buffer, 0, cast_slice(&indices));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("screensaver_pass"),

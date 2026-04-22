@@ -30,8 +30,7 @@ fn proof_glb_contains_animation_clip() {
     let path = animated_glb_path();
 
     // Load through the actual VZGLYD GLB parser
-    let scene = vzglyd_kernel::glb::load_glb_scene(&path, None)
-        .expect("animated GLB should parse");
+    let scene = vzglyd_kernel::glb::load_glb_scene(&path, None).expect("animated GLB should parse");
 
     // THE CORE CLAIM: this scene has exactly 1 animation clip
     assert_eq!(
@@ -43,13 +42,20 @@ fn proof_glb_contains_animation_clip() {
 
     let clip = &scene.animations[0];
     assert_eq!(clip.name, "SpinAction");
-    assert!((clip.duration - 2.0).abs() < 0.001, "Duration should be 2.0s");
+    assert!(
+        (clip.duration - 2.0).abs() < 0.001,
+        "Duration should be 2.0s"
+    );
 
     // It has exactly 1 channel (rotation on the cube node)
     assert_eq!(clip.channels.len(), 1);
     let ch = &clip.channels[0];
     assert_eq!(ch.keyframe_times.len(), 4, "Should have 4 keyframes");
-    assert_eq!(ch.keyframe_values.len(), 4, "Should have 4 quaternion values");
+    assert_eq!(
+        ch.keyframe_values.len(),
+        4,
+        "Should have 4 quaternion values"
+    );
 }
 
 #[test]
@@ -88,14 +94,26 @@ fn proof_keyframe_quaternions_match_source_data() {
     let sin45 = (std::f32::consts::PI / 4.0).sin();
     let cos45 = (std::f32::consts::PI / 4.0).cos();
     assert!((q1[0] - 0.0).abs() < 0.01);
-    assert!((q1[1] - sin45).abs() < 0.01, "q1.y should be sin(45°) ≈ 0.707, got {}", q1[1]);
+    assert!(
+        (q1[1] - sin45).abs() < 0.01,
+        "q1.y should be sin(45°) ≈ 0.707, got {}",
+        q1[1]
+    );
     assert!((q1[2] - 0.0).abs() < 0.01);
-    assert!((q1[3] - cos45).abs() < 0.01, "q1.w should be cos(45°) ≈ 0.707, got {}", q1[3]);
+    assert!(
+        (q1[3] - cos45).abs() < 0.01,
+        "q1.w should be cos(45°) ≈ 0.707, got {}",
+        q1[3]
+    );
 
     // Keyframe 2: 180° around Y → q = [0, sin(90°), 0, cos(90°)] = [0, 1.0, 0, ~0]
     let q2 = ch.keyframe_values[2];
     assert!((q2[0] - 0.0).abs() < 0.01);
-    assert!((q2[1] - 1.0).abs() < 0.01, "q2.y should be ~1.0, got {}", q2[1]);
+    assert!(
+        (q2[1] - 1.0).abs() < 0.01,
+        "q2.y should be ~1.0, got {}",
+        q2[1]
+    );
     assert!((q2[2] - 0.0).abs() < 0.01);
     assert!(q2[3].abs() < 0.01, "q2.w should be ~0, got {}", q2[3]);
 }
@@ -109,7 +127,10 @@ fn proof_animation_channel_targets_correct_node() {
     let ch = &scene.animations[0].channels[0];
 
     // The channel targets node 0 (the "RotatingCube" node)
-    assert_eq!(ch.node_index, 0, "Channel should target node 0 (RotatingCube)");
+    assert_eq!(
+        ch.node_index, 0,
+        "Channel should target node 0 (RotatingCube)"
+    );
 
     // The node should actually exist and have the right name
     let node = &scene.mesh_nodes[0];

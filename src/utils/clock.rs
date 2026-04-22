@@ -1,7 +1,7 @@
 //! Clock and time utilities.
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{Local, Timelike};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Returns the current time in seconds since UNIX epoch.
 pub fn now_secs() -> f64 {

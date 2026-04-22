@@ -38,6 +38,11 @@ cargo run -- --trace --trace-out /tmp/slide.perfetto.json --scene /path/to/slide
 cargo run -- --trace --slides-dir slides/
 ```
 
+Startup preload tuning:
+
+- `VZGLYD_LOADER_JOBS=<N>` sets the number of slide loader workers. The default is conservative on Raspberry Pi and capped by CPU availability.
+- `VZGLYD_WASMTIME_CACHE=0` disables Wasmtime's persistent module cache. The cache is enabled by default when Wasmtime can load its default cache config.
+
 ## Shared Slides Repo
 
 The native host now expects `--slides-dir` to point at a shared slide repository root.

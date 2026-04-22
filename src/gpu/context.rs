@@ -459,7 +459,8 @@ impl GpuContext {
     /// CRT overscan); values above `1.0` zoom in and crop the edges.
     pub fn set_display_scale(&mut self, scale: f32) {
         self.display_scale = scale;
-        self.queue.write_buffer(&self.blit_scale_buf, 0, bytemuck::bytes_of(&scale));
+        self.queue
+            .write_buffer(&self.blit_scale_buf, 0, bytemuck::bytes_of(&scale));
     }
 
     /// Returns the pixel rect actually occupied by the visible slide image,

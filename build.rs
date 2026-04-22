@@ -25,8 +25,13 @@ fn main() {
 
     // Pack loading.vzglyd
     let loading_vzglyd = out_dir.join("loading.vzglyd");
-    pack_vzglyd(&loading_vzglyd, &loading_wasm, &loading_slide_dir, &["assets", "art"])
-        .expect("failed to pack loading.vzglyd");
+    pack_vzglyd(
+        &loading_vzglyd,
+        &loading_wasm,
+        &loading_slide_dir,
+        &["assets", "art"],
+    )
+    .expect("failed to pack loading.vzglyd");
 
     // ── 2. Compile information-slide to wasm32-wasip1 ────────────────────────
     let info_slide_dir = manifest_dir.join("information-slide");
@@ -71,16 +76,15 @@ fn compile_wasm_slide(
     }
 
     // Rebuild whenever slide source changes.
-    println!("cargo:rerun-if-changed={}/src", package_name.replace('-', "_"));
+    println!(
+        "cargo:rerun-if-changed={}/src",
+        package_name.replace('-', "_")
+    );
 
     Ok(())
 }
 
-fn resolve_slide_wasm(
-    manifest_dir: &Path,
-    slide_dir: &Path,
-    slide_name: &str,
-) -> Option<PathBuf> {
+fn resolve_slide_wasm(manifest_dir: &Path, slide_dir: &Path, slide_name: &str) -> Option<PathBuf> {
     let wasm_file = format!("{}.wasm", slide_name);
     let candidates = [
         manifest_dir.join(format!("target/wasm32-wasip1/release/{}", wasm_file)),

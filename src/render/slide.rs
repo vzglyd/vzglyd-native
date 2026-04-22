@@ -15,9 +15,9 @@ use crate::gpu::context::{GpuContext, HEIGHT, OffscreenTarget, WIDTH};
 use crate::render::shader_contract::{ShaderContract, assemble_slide_shader_source};
 use crate::slide::{DecodedSlideSpec, decode_slide_spec};
 use crate::slide_loader::{self, LoadError};
-use vzglyd_kernel::manifest::SlideManifest;
 use crate::trace::active_trace_recorder;
 use crate::utils::clock::local_clock_seconds;
+use vzglyd_kernel::manifest::SlideManifest;
 
 /// Uniforms for screen-space slides.
 #[repr(C)]
@@ -291,7 +291,7 @@ impl ScreenSlideRenderer {
                     })),
                     index_buffer: Arc::new(ctx.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("overlay_index_buffer"),
-                        size: (spec.limits.max_indices as usize * std::mem::size_of::<u16>())
+                        size: (spec.limits.max_indices as usize * std::mem::size_of::<u32>())
                             as u64,
                         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
@@ -471,7 +471,7 @@ impl ScreenSlideRenderer {
                                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                 pass.set_index_buffer(
                                     mesh.index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint16,
+                                    wgpu::IndexFormat::Uint32,
                                 );
                                 pass.draw_indexed(draw.index_range.start..draw_range_end, 0, 0..1);
                             }
@@ -487,7 +487,7 @@ impl ScreenSlideRenderer {
                         pass.set_vertex_buffer(0, overlay.buffers.vertex_buffer.slice(..));
                         pass.set_index_buffer(
                             overlay.buffers.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint16,
+                            wgpu::IndexFormat::Uint32,
                         );
                         pass.draw_indexed(0..overlay.buffers.current_index_count, 0, 0..1);
                     }
@@ -772,7 +772,7 @@ impl WorldSlideRenderer {
                                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                     pass.set_index_buffer(
                                         mesh.index_buffer.slice(..),
-                                        wgpu::IndexFormat::Uint16,
+                                        wgpu::IndexFormat::Uint32,
                                     );
                                     pass.draw_indexed(
                                         draw.index_range.start..draw_range_end,
@@ -801,7 +801,7 @@ impl WorldSlideRenderer {
                                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                     pass.set_index_buffer(
                                         mesh.index_buffer.slice(..),
-                                        wgpu::IndexFormat::Uint16,
+                                        wgpu::IndexFormat::Uint32,
                                     );
                                     pass.draw_indexed(
                                         draw.index_range.start
@@ -866,12 +866,14 @@ impl OverlayRuntime {
             .vertices
             .len()
             .min(self.buffers.vertex_capacity as usize))
-            / 4 * 4;
+            / 4
+            * 4;
         let used_indices = (overlay
             .indices
             .len()
             .min(self.buffers.index_capacity as usize))
-            / 6 * 6;
+            / 6
+            * 6;
         ctx.queue.write_buffer(
             &self.buffers.vertex_buffer,
             0,
@@ -1074,11 +1076,12 @@ fn create_static_mesh_buffers<V: Pod>(device: &wgpu::Device, mesh: &StaticMesh<V
 
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("static_index_buffer"),
-        size: mesh.indices.len() as u64 * 2,
+        size: mesh.indices.len() as u64 * std::mem::size_of::<u32>() as u64,
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    index_buffer.slice(..).get_mapped_range_mut()[..mesh.indices.len() * 2]
+    index_buffer.slice(..).get_mapped_range_mut()
+        [..mesh.indices.len() * std::mem::size_of::<u32>()]
         .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
     index_buffer.unmap();
 
@@ -1106,11 +1109,12 @@ fn create_dynamic_mesh_buffers(
 
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dynamic_index_buffer"),
-        size: index_capacity as u64 * 2,
+        size: index_capacity as u64 * std::mem::size_of::<u32>() as u64,
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    index_buffer.slice(..).get_mapped_range_mut()[..mesh.indices.len() * 2]
+    index_buffer.slice(..).get_mapped_range_mut()
+        [..mesh.indices.len() * std::mem::size_of::<u32>()]
         .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
     index_buffer.unmap();
 
@@ -1437,9 +1441,7 @@ fn sample_animation_matrices(
 
             // Find the keyframe interval
             let mut ki = 0;
-            while ki + 1 < channel.keyframe_times.len()
-                && channel.keyframe_times[ki + 1] < t
-            {
+            while ki + 1 < channel.keyframe_times.len() && channel.keyframe_times[ki + 1] < t {
                 ki += 1;
             }
             if ki + 1 >= channel.keyframe_times.len() {
@@ -1770,7 +1772,39 @@ pub fn load_wasm_slide(
     params_bytes: Option<&[u8]>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
-    if let Ok((slide, manifest)) = load_screen_wasm_slide(path, params_bytes, extra_env) {
+    let engine = slide_loader::make_wasm_engine()?;
+    load_wasm_slide_with_engine(&engine, path, params_bytes, extra_env)
+}
+
+pub(crate) fn load_wasm_slide_with_engine(
+    engine: &wasmtime::Engine,
+    path: &str,
+    params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
+    load_wasm_slide_with_engine_and_sidecar_params(
+        engine,
+        path,
+        params_bytes,
+        params_bytes,
+        extra_env,
+    )
+}
+
+pub(crate) fn load_wasm_slide_with_engine_and_sidecar_params(
+    engine: &wasmtime::Engine,
+    path: &str,
+    slide_params_bytes: Option<&[u8]>,
+    sidecar_params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
+    if let Ok((slide, manifest)) = load_screen_wasm_slide(
+        engine,
+        path,
+        slide_params_bytes,
+        sidecar_params_bytes,
+        extra_env,
+    ) {
         if let LoadedSlide::Screen(screen) = &slide {
             if screen.spec.scene_space == SceneSpace::Screen2D && screen.spec.validate().is_ok() {
                 return Ok((slide, Some(manifest)));
@@ -1778,7 +1812,13 @@ pub fn load_wasm_slide(
         }
     }
 
-    let (loaded, manifest) = load_spec_with_manifest::<WorldVertex>(path, params_bytes, extra_env)?;
+    let (loaded, manifest) = load_spec_with_manifest::<WorldVertex>(
+        engine,
+        path,
+        slide_params_bytes,
+        sidecar_params_bytes,
+        extra_env,
+    )?;
     Ok((
         LoadedSlide::World(LoadedWorldSlide {
             spec: loaded.spec,
@@ -1790,11 +1830,19 @@ pub fn load_wasm_slide(
 }
 
 fn load_screen_wasm_slide(
+    engine: &wasmtime::Engine,
     path: &str,
-    params_bytes: Option<&[u8]>,
+    slide_params_bytes: Option<&[u8]>,
+    sidecar_params_bytes: Option<&[u8]>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSlide, SlideManifest), LoadError> {
-    let (loaded, manifest) = load_spec_with_manifest::<ScreenVertex>(path, params_bytes, extra_env)?;
+    let (loaded, manifest) = load_spec_with_manifest::<ScreenVertex>(
+        engine,
+        path,
+        slide_params_bytes,
+        sidecar_params_bytes,
+        extra_env,
+    )?;
     Ok((
         LoadedSlide::Screen(LoadedScreenSlide {
             spec: loaded.spec,
@@ -1806,8 +1854,10 @@ fn load_screen_wasm_slide(
 }
 
 fn load_spec_with_manifest<V>(
+    engine: &wasmtime::Engine,
     path: &str,
-    params_bytes: Option<&[u8]>,
+    slide_params_bytes: Option<&[u8]>,
+    sidecar_params_bytes: Option<&[u8]>,
     extra_env: &[(String, String)],
 ) -> Result<(slide_loader::LoadedSpec<V>, SlideManifest), LoadError>
 where
@@ -1816,9 +1866,21 @@ where
     if Path::new(path).extension().and_then(|ext| ext.to_str())
         == Some(slide_loader::PACKAGE_ARCHIVE_EXTENSION)
     {
-        slide_loader::load_slide_from_archive(path, params_bytes, extra_env)
+        slide_loader::load_slide_from_archive_with_engine_and_sidecar_params(
+            engine,
+            path,
+            slide_params_bytes,
+            sidecar_params_bytes,
+            extra_env,
+        )
     } else {
-        slide_loader::load_slide_from_wasm(path, params_bytes, extra_env)
+        slide_loader::load_slide_from_wasm_with_engine_and_sidecar_params(
+            engine,
+            path,
+            slide_params_bytes,
+            sidecar_params_bytes,
+            extra_env,
+        )
     }
 }
 
@@ -1859,10 +1921,10 @@ mod animation_tests {
     fn test_slerp_identity_to_rotation() {
         let q0 = glam::Quat::IDENTITY;
         let q90_z = glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
-        
+
         let q = q0.slerp(q90_z, 0.5);
         let expected = glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_4);
-        
+
         assert!((q.x - expected.x).abs() < 1e-6);
         assert!((q.y - expected.y).abs() < 1e-6);
         assert!((q.z - expected.z).abs() < 1e-6);
@@ -1873,14 +1935,14 @@ mod animation_tests {
     fn test_slerp_full_rotation() {
         let q0 = glam::Quat::IDENTITY;
         let q180_y = glam::Quat::from_rotation_y(std::f32::consts::PI);
-        
+
         let q = q0.slerp(q180_y, 1.0);
-        
+
         // Quaternions have double cover: q and -q represent the same rotation.
         // Compare the rotation matrices instead of raw components.
         let mat_q = Mat4::from_quat(q);
         let mat_expected = Mat4::from_quat(q180_y);
-        
+
         for i in 0..16 {
             let diff = (mat_q.to_cols_array()[i] - mat_expected.to_cols_array()[i]).abs();
             assert!(diff < 1e-6, "Quaternion rotation mismatch at element {}", i);
@@ -1900,10 +1962,7 @@ mod animation_tests {
             node_label: "cube".to_string(),
             path: AnimationPath::Translation,
             keyframe_times: vec![0.0, 1.0],
-            keyframe_values: vec![
-                [0.0, 0.0, 0.0, 0.0],
-                [10.0, 0.0, 0.0, 0.0],
-            ],
+            keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0, 0.0]],
         };
 
         let clip = AnimationClip {
@@ -1925,18 +1984,26 @@ mod animation_tests {
         let expected = Mat4::from_translation(glam::Vec3::new(5.0, 0.0, 0.0));
         eprintln!("Midpoint matrix: {:?}", matrices[0]);
         eprintln!("Expected: {:?}", expected);
-        assert!((matrices[0].w_axis.x - expected.w_axis.x).abs() < 1e-6, 
-            "w_axis.x mismatch: {} vs {}", matrices[0].w_axis.x, expected.w_axis.x);
+        assert!(
+            (matrices[0].w_axis.x - expected.w_axis.x).abs() < 1e-6,
+            "w_axis.x mismatch: {} vs {}",
+            matrices[0].w_axis.x,
+            expected.w_axis.x
+        );
         assert!((matrices[0].w_axis.y - expected.w_axis.y).abs() < 1e-6);
         assert!((matrices[0].w_axis.z - expected.w_axis.z).abs() < 1e-6);
-        
+
         // Test at end
         let matrices = sample_animation_matrices(&[clip.clone()], 1.0, &mesh_labels);
         eprintln!("End matrix: {:?}", matrices[0]);
         let expected_end = Mat4::from_translation(glam::Vec3::new(10.0, 0.0, 0.0));
         eprintln!("Expected end: {:?}", expected_end);
-        assert!((matrices[0].w_axis.x - expected_end.w_axis.x).abs() < 1e-6,
-            "End w_axis.x mismatch: {} vs {}", matrices[0].w_axis.x, expected_end.w_axis.x);
+        assert!(
+            (matrices[0].w_axis.x - expected_end.w_axis.x).abs() < 1e-6,
+            "End w_axis.x mismatch: {} vs {}",
+            matrices[0].w_axis.x,
+            expected_end.w_axis.x
+        );
     }
 
     #[test]
@@ -1946,34 +2013,36 @@ mod animation_tests {
             path: AnimationPath::Rotation,
             keyframe_times: vec![0.0, 2.0],
             keyframe_values: vec![
-                [0.0, 0.0, 0.0, 1.0], // identity quaternion
+                [0.0, 0.0, 0.0, 1.0],             // identity quaternion
                 [0.0, 0.7071068, 0.0, 0.7071068], // 90° around Y
             ],
         };
-        
+
         let clip = AnimationClip {
             name: "spin".to_string(),
             duration: 2.0,
             looped: true,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["rotor".to_string()];
-        
+
         // Test at halfway (45° rotation)
         let matrices = sample_animation_matrices(&[clip], 1.0, &mesh_labels);
         let expected_q = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_4);
         let expected = Mat4::from_quat(expected_q);
-        
+
         // Compare matrix elements using to_cols_array()
         let mat_arr = matrices[0].to_cols_array();
         let exp_arr = expected.to_cols_array();
-        
+
         for i in 0..16 {
             assert!(
                 (mat_arr[i] - exp_arr[i]).abs() < 1e-5,
                 "Matrix element {} mismatch: {} vs {}",
-                i, mat_arr[i], exp_arr[i]
+                i,
+                mat_arr[i],
+                exp_arr[i]
             );
         }
     }
@@ -1984,29 +2053,26 @@ mod animation_tests {
             node_label: "balloon".to_string(),
             path: AnimationPath::Scale,
             keyframe_times: vec![0.0, 1.0],
-            keyframe_values: vec![
-                [1.0, 1.0, 1.0, 0.0],
-                [2.0, 2.0, 2.0, 0.0],
-            ],
+            keyframe_values: vec![[1.0, 1.0, 1.0, 0.0], [2.0, 2.0, 2.0, 0.0]],
         };
-        
+
         let clip = AnimationClip {
             name: "grow".to_string(),
             duration: 1.0,
             looped: false,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["balloon".to_string()];
-        
+
         // Test at midpoint
         let matrices = sample_animation_matrices(&[clip], 0.5, &mesh_labels);
         let expected = Mat4::from_scale(glam::Vec3::new(1.5, 1.5, 1.5));
-        
+
         // Compare diagonal elements (scale values)
         let mat_arr = matrices[0].to_cols_array();
         let exp_arr = expected.to_cols_array();
-        
+
         for i in 0..4 {
             assert!(
                 (mat_arr[i * 5] - exp_arr[i * 5]).abs() < 1e-6,
@@ -2027,24 +2093,24 @@ mod animation_tests {
                 [0.0, 1.0, 0.0, 0.0], // 180° around Y
             ],
         };
-        
+
         let clip = AnimationClip {
             name: "loop".to_string(),
             duration: 1.0,
             looped: true,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["spinner".to_string()];
-        
+
         // Test at t=1.5 (should wrap to 0.5)
         let matrices = sample_animation_matrices(&[clip], 1.5, &mesh_labels);
         let expected_q = glam::Quat::from_rotation_y(std::f32::consts::PI * 0.5);
         let expected = Mat4::from_quat(expected_q);
-        
+
         let mat_arr = matrices[0].to_cols_array();
         let exp_arr = expected.to_cols_array();
-        
+
         for i in 0..16 {
             assert!(
                 (mat_arr[i] - exp_arr[i]).abs() < 1e-5,
@@ -2060,25 +2126,22 @@ mod animation_tests {
             node_label: "door".to_string(),
             path: AnimationPath::Translation,
             keyframe_times: vec![0.0, 2.0],
-            keyframe_values: vec![
-                [0.0, 0.0, 0.0, 0.0],
-                [0.0, 3.0, 0.0, 0.0],
-            ],
+            keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [0.0, 3.0, 0.0, 0.0]],
         };
-        
+
         let clip = AnimationClip {
             name: "open".to_string(),
             duration: 2.0,
             looped: false,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["door".to_string()];
-        
+
         // Test at t=3.0 (should clamp to end value)
         let matrices = sample_animation_matrices(&[clip], 3.0, &mesh_labels);
         let expected = Mat4::from_translation(glam::Vec3::new(0.0, 3.0, 0.0));
-        
+
         assert!((matrices[0].w_axis.y - expected.w_axis.y).abs() < 1e-6);
     }
 
@@ -2088,40 +2151,40 @@ mod animation_tests {
             node_label: "cube1".to_string(),
             path: AnimationPath::Translation,
             keyframe_times: vec![0.0, 1.0],
-            keyframe_values: vec![
-                [0.0, 0.0, 0.0, 0.0],
-                [5.0, 0.0, 0.0, 0.0],
-            ],
+            keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0]],
         };
-        
+
         let channel2 = AnimationChannel {
             node_label: "cube2".to_string(),
             path: AnimationPath::Translation,
             keyframe_times: vec![0.0, 1.0],
-            keyframe_values: vec![
-                [0.0, 0.0, 0.0, 0.0],
-                [0.0, 5.0, 0.0, 0.0],
-            ],
+            keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [0.0, 5.0, 0.0, 0.0]],
         };
-        
+
         let clip = AnimationClip {
             name: "move_both".to_string(),
             duration: 1.0,
             looped: true,
             channels: vec![channel1, channel2],
         };
-        
+
         let mesh_labels = vec![
             "cube1".to_string(),
             "cube2".to_string(),
             "static".to_string(),
         ];
-        
+
         let matrices = sample_animation_matrices(&[clip], 1.0, &mesh_labels);
-        
+
         assert_eq!(matrices.len(), 3);
-        assert_eq!(matrices[0], Mat4::from_translation(glam::Vec3::new(5.0, 0.0, 0.0)));
-        assert_eq!(matrices[1], Mat4::from_translation(glam::Vec3::new(0.0, 5.0, 0.0)));
+        assert_eq!(
+            matrices[0],
+            Mat4::from_translation(glam::Vec3::new(5.0, 0.0, 0.0))
+        );
+        assert_eq!(
+            matrices[1],
+            Mat4::from_translation(glam::Vec3::new(0.0, 5.0, 0.0))
+        );
         assert_eq!(matrices[2], Mat4::IDENTITY); // Static mesh unchanged
     }
 
@@ -2131,22 +2194,19 @@ mod animation_tests {
             node_label: "test".to_string(),
             path: AnimationPath::Translation,
             keyframe_times: vec![0.0, 0.0],
-            keyframe_values: vec![
-                [0.0, 0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-            ],
+            keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
         };
-        
+
         let clip = AnimationClip {
             name: "zero".to_string(),
             duration: 0.0,
             looped: true,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["test".to_string()];
         let matrices = sample_animation_matrices(&[clip], 1.0, &mesh_labels);
-        
+
         // Should remain identity when duration is zero
         assert_eq!(matrices[0], Mat4::IDENTITY);
     }
@@ -2157,22 +2217,19 @@ mod animation_tests {
             node_label: "nonexistent".to_string(),
             path: AnimationPath::Translation,
             keyframe_times: vec![0.0, 1.0],
-            keyframe_values: vec![
-                [0.0, 0.0, 0.0, 0.0],
-                [10.0, 0.0, 0.0, 0.0],
-            ],
+            keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0, 0.0]],
         };
-        
+
         let clip = AnimationClip {
             name: "ghost".to_string(),
             duration: 1.0,
             looped: true,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["actual_mesh".to_string()];
         let matrices = sample_animation_matrices(&[clip], 0.5, &mesh_labels);
-        
+
         // Should remain identity since mesh doesn't exist
         assert_eq!(matrices[0], Mat4::IDENTITY);
     }
@@ -2185,17 +2242,17 @@ mod animation_tests {
             keyframe_times: vec![0.0],
             keyframe_values: vec![[0.0, 0.0, 0.0, 0.0]],
         };
-        
+
         let clip = AnimationClip {
             name: "single_kf".to_string(),
             duration: 1.0,
             looped: true,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["test".to_string()];
         let matrices = sample_animation_matrices(&[clip], 0.5, &mesh_labels);
-        
+
         // Should remain identity with insufficient keyframes
         assert_eq!(matrices[0], Mat4::IDENTITY);
     }
@@ -2213,20 +2270,20 @@ mod animation_tests {
                 [0.0, 0.0, 0.0, 0.0],
             ],
         };
-        
+
         let clip = AnimationClip {
             name: "bounce".to_string(),
             duration: 1.0,
             looped: true,
             channels: vec![channel],
         };
-        
+
         let mesh_labels = vec!["bouncer".to_string()];
-        
+
         // Test at first interval (t=0.25)
         let matrices = sample_animation_matrices(&[clip.clone()], 0.25, &mesh_labels);
         assert!((matrices[0].w_axis.y - 2.5).abs() < 0.1);
-        
+
         // Test at second interval (t=0.75)
         let matrices = sample_animation_matrices(&[clip], 0.75, &mesh_labels);
         assert!((matrices[0].w_axis.y - 2.5).abs() < 0.1);

@@ -10,8 +10,8 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::PathBuf;
-use vzglyd_native::slide_loader::pack_slide_directory;
 use vzglyd_kernel::glb::load_glb_scene;
+use vzglyd_native::slide_loader::pack_slide_directory;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -33,8 +33,11 @@ fn temp_slide_dir(label: &str) -> PathBuf {
 /// Write a minimal manifest.json + dummy slide.wasm to a slide directory.
 fn write_minimal_slide(dir: &PathBuf, manifest_json: &str) {
     write_required_art_assets(dir);
-    fs::write(dir.join("manifest.json"), manifest_with_required_art(manifest_json))
-        .expect("write manifest");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_with_required_art(manifest_json),
+    )
+    .expect("write manifest");
     fs::write(dir.join("slide.wasm"), b"\0asm\x01\0\0\0").expect("write dummy wasm");
 }
 
@@ -49,7 +52,9 @@ fn write_required_art_assets(dir: &PathBuf) {
 fn manifest_with_required_art(manifest: &str) -> String {
     let mut value: serde_json::Value =
         serde_json::from_str(manifest).expect("test manifest should be valid JSON");
-    let object = value.as_object_mut().expect("test manifest should be an object");
+    let object = value
+        .as_object_mut()
+        .expect("test manifest should be an object");
     let assets = object
         .entry("assets")
         .or_insert_with(|| serde_json::json!({}));
@@ -94,11 +99,7 @@ fn e2e_glb_parses_as_scene() {
     fs::write(&glb_path, &glb).expect("write glb");
 
     let result = load_glb_scene(&glb_path, None);
-    assert!(
-        result.is_ok(),
-        "GLB should parse: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "GLB should parse: {:?}", result.err());
 
     let scene = result.unwrap();
     // Should have at least one mesh node
@@ -206,9 +207,9 @@ fn e2e_slide_spec_includes_animations_from_glb() {
             path: AnimationPath::Rotation,
             keyframe_times: vec![0.0, 1.0, 2.0],
             keyframe_values: vec![
-                [0.0, 0.0, 0.0, 1.0],     // identity quaternion
+                [0.0, 0.0, 0.0, 1.0],       // identity quaternion
                 [0.0, 0.7071, 0.0, 0.7071], // 90 degrees around Y
-                [0.0, 1.0, 0.0, 0.0],     // 180 degrees around Y
+                [0.0, 1.0, 0.0, 0.0],       // 180 degrees around Y
             ],
         }],
     };
@@ -229,10 +230,7 @@ fn e2e_animation_sampling_translation() {
         node_label: "MovingCube".to_string(),
         path: AnimationPath::Translation,
         keyframe_times: vec![0.0, 1.0],
-        keyframe_values: vec![
-            [0.0, 0.0, 0.0, 0.0],
-            [5.0, 0.0, 0.0, 0.0],
-        ],
+        keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0]],
     };
 
     let clip = AnimationClip {
@@ -271,10 +269,7 @@ fn e2e_animation_sampling_translation() {
         v0[2] + (v1[2] - v0[2]) * alpha,
     );
 
-    assert!(
-        (result.x - 2.5).abs() < 0.001,
-        "At t=0.5, x should be 2.5"
-    );
+    assert!((result.x - 2.5).abs() < 0.001, "At t=0.5, x should be 2.5");
 }
 
 #[test]
@@ -316,10 +311,7 @@ fn e2e_animation_sampling_scale() {
         node_label: "GrowingSphere".to_string(),
         path: AnimationPath::Scale,
         keyframe_times: vec![0.0, 2.0],
-        keyframe_values: vec![
-            [1.0, 1.0, 1.0, 0.0],
-            [3.0, 3.0, 3.0, 0.0],
-        ],
+        keyframe_values: vec![[1.0, 1.0, 1.0, 0.0], [3.0, 3.0, 3.0, 0.0]],
     };
 
     let clip = AnimationClip {
@@ -367,10 +359,7 @@ fn e2e_animation_looping_wraps_elapsed_time() {
         node_label: "Spinner".to_string(),
         path: AnimationPath::Translation,
         keyframe_times: vec![0.0, 1.0],
-        keyframe_values: vec![
-            [0.0, 0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-        ],
+        keyframe_values: vec![[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
     };
 
     let clip = AnimationClip {
@@ -409,10 +398,7 @@ fn e2e_animation_non_looped_clamps_to_end() {
             node_label: "Faller".to_string(),
             path: AnimationPath::Translation,
             keyframe_times: vec![0.0, 2.0],
-            keyframe_values: vec![
-                [0.0, 10.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-            ],
+            keyframe_values: vec![[0.0, 10.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
         }],
     };
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use vzglyd_kernel::glb::{self, GlbError};
 use vzglyd_kernel::trace::TraceRecorder;
@@ -31,11 +31,11 @@ use wasmtime::{Config, Engine, Instance, Memory, Module, Store, Trap, TypedFunc}
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use vzglyd_kernel::manifest::{AssetRef, SlideManifest};
 use crate::audio::SoundRegistry;
 use crate::trace::{
     active_trace_recorder, parse_guest_trace_end_payload, parse_guest_trace_payload,
 };
+use vzglyd_kernel::manifest::{AssetRef, SlideManifest};
 
 pub const ABI_VERSION: u32 = vzglyd_slide::ABI_VERSION;
 pub(crate) const SLIDE_UPDATE_NO_CHANGE: i32 = 0;
@@ -160,6 +160,7 @@ struct SidecarStore {
     tx: SlideChannel,
     label: String,
     last_network_response: Vec<u8>,
+    params_bytes: Option<Vec<u8>>,
     request_executor: SidecarRequestExecutor,
     trace_recorder: Option<TraceRecorder>,
     trace_thread: String,
@@ -527,10 +528,33 @@ fn arm_teardown_timeout(engine: Engine, timeout: Duration) -> Result<(), LoadErr
         .map_err(|error| LoadError::WasmLoad(format!("failed to arm teardown timeout: {error}")))
 }
 
-fn make_wasm_engine() -> Result<Engine, LoadError> {
+pub(crate) fn make_wasm_engine() -> Result<Engine, LoadError> {
     let mut config = Config::new();
     config.epoch_interruption(true);
+    if wasmtime_cache_enabled() {
+        if let Err(error) = config.cache_config_load_default() {
+            log::warn!("failed to enable Wasmtime cache; continuing without it: {error}");
+        }
+    }
     Engine::new(&config).map_err(|error| LoadError::WasmLoad(error.to_string()))
+}
+
+fn wasmtime_cache_enabled() -> bool {
+    std::env::var("VZGLYD_WASMTIME_CACHE")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !(value == "0" || value == "false" || value == "off" || value == "no")
+        })
+        .unwrap_or(true)
+}
+
+fn log_phase_duration(label: &str, phase: &str, started: Instant) {
+    log::info!(
+        "[loader:timing] {} {} took {:.1}ms",
+        label,
+        phase,
+        started.elapsed().as_secs_f64() * 1000.0
+    );
 }
 
 fn configure_runtime_store<T>(store: &mut Store<T>) {
@@ -879,8 +903,10 @@ fn load_sidecar_with_executor(
     request_executor: SidecarRequestExecutor,
     extra_env: &[(String, String)],
 ) -> Result<SidecarHandle, LoadError> {
+    let compile_started = Instant::now();
     let module =
         Module::new(engine, wasm_bytes).map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    log_phase_duration(runtime_label, "sidecar_module_compile", compile_started);
     let engine = engine.clone();
     let wasi_preopens = wasi_preopens.to_vec();
     let runtime_label = runtime_label.to_string();
@@ -951,6 +977,7 @@ fn run_sidecar_module(
             tx,
             label: runtime_label.to_string(),
             last_network_response: Vec::new(),
+            params_bytes: params_bytes.map(|bytes| bytes.to_vec()),
             request_executor,
             trace_recorder: active_trace_recorder(),
             trace_thread: format!("sidecar:{runtime_label}"),
@@ -996,6 +1023,134 @@ fn run_sidecar_module(
             "channel_poll",
             |_caller: wasmtime::Caller<'_, SidecarStore>, _ptr: i32, _len: i32| -> i32 {
                 HOST_CHANNEL_EMPTY
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "artifact_publish",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>,
+             kind_ptr: i32,
+             kind_len: i32,
+             data_ptr: i32,
+             data_len: i32|
+             -> i32 {
+                let kind_bytes = match read_guest_bytes(&mut caller, kind_ptr, kind_len) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return HOST_ERROR,
+                };
+                let kind = String::from_utf8_lossy(&kind_bytes).to_string();
+                let bytes = match read_guest_bytes(&mut caller, data_ptr, data_len) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return HOST_ERROR,
+                };
+                log::info!(
+                    "sidecar:{} published artifact '{}' ({} bytes): {}",
+                    caller.data().label,
+                    kind,
+                    bytes.len(),
+                    preview_bytes(&bytes, 160)
+                );
+                if kind == "published_output" {
+                    caller.data().tx.push_latest(bytes);
+                }
+                WASI_ERRNO_SUCCESS
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "params_len",
+            |caller: wasmtime::Caller<'_, SidecarStore>| -> i32 {
+                caller
+                    .data()
+                    .params_bytes
+                    .as_ref()
+                    .map_or(0, |params| params.len() as i32)
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "params_read",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>, ptr: i32, len: i32| -> i32 {
+                if ptr < 0 || len < 0 {
+                    return HOST_ERROR;
+                }
+                let params = caller.data().params_bytes.clone().unwrap_or_default();
+                if params.len() > len as usize {
+                    return HOST_BUFFER_TOO_SMALL;
+                }
+                match write_guest_bytes(&mut caller, ptr, &params) {
+                    Ok(()) => params.len() as i32,
+                    Err(_) => HOST_ERROR,
+                }
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "sleep_ms",
+            |caller: wasmtime::Caller<'_, SidecarStore>, duration_ms: i64| -> i32 {
+                log::info!(
+                    "sidecar:{} sleeping for {}ms",
+                    caller.data().label,
+                    duration_ms
+                );
+                if duration_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(duration_ms as u64));
+                }
+                WASI_ERRNO_SUCCESS
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "announce_sleep",
+            |caller: wasmtime::Caller<'_, SidecarStore>, duration_ms: i64| -> i32 {
+                log::info!(
+                    "sidecar:{} sleeping for {}ms",
+                    caller.data().label,
+                    duration_ms
+                );
+                0
+            },
+        )
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+    linker
+        .func_wrap(
+            "vzglyd_host",
+            "register_manifest",
+            |mut caller: wasmtime::Caller<'_, SidecarStore>, ptr: i32, len: i32| -> i32 {
+                let bytes = match read_guest_bytes(&mut caller, ptr, len) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return HOST_ERROR,
+                };
+                match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(manifest) => {
+                        let logical_id = manifest
+                            .get("logical_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        log::info!(
+                            "sidecar:{} registered manifest '{}'",
+                            caller.data().label,
+                            logical_id
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "sidecar:{} register_manifest received invalid JSON: {error}",
+                            caller.data().label
+                        );
+                    }
+                }
+                WASI_ERRNO_SUCCESS
             },
         )
         .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
@@ -2382,8 +2537,10 @@ where
     V: Serialize + DeserializeOwned + bytemuck::Pod,
 {
     let engine = make_wasm_engine()?;
+    let compile_started = Instant::now();
     let module =
         Module::new(&engine, wasm_bytes).map_err(|e| LoadError::WasmLoad(e.to_string()))?;
+    log_phase_duration("embedded-slide", "module_compile", compile_started);
     let (loaded, _channel) = load_slide(
         &engine,
         &module,
@@ -2399,6 +2556,7 @@ where
     Ok(loaded)
 }
 
+#[cfg(test)]
 pub(crate) fn load_slide_from_wasm<V>(
     wasm_path: &str,
     params_bytes: Option<&[u8]>,
@@ -2407,16 +2565,61 @@ pub(crate) fn load_slide_from_wasm<V>(
 where
     V: PackageMeshVertex,
 {
+    let engine = make_wasm_engine()?;
+    load_slide_from_wasm_with_engine(&engine, wasm_path, params_bytes, extra_env)
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_slide_from_wasm_with_engine<V>(
+    engine: &Engine,
+    wasm_path: &str,
+    params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
+where
+    V: PackageMeshVertex,
+{
+    load_slide_from_wasm_with_engine_and_sidecar_params(
+        engine,
+        wasm_path,
+        params_bytes,
+        params_bytes,
+        extra_env,
+    )
+}
+
+pub(crate) fn load_slide_from_wasm_with_engine_and_sidecar_params<V>(
+    engine: &Engine,
+    wasm_path: &str,
+    slide_params_bytes: Option<&[u8]>,
+    sidecar_params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
+where
+    V: PackageMeshVertex,
+{
     const MAX_WASM_BYTES: u64 = 10 * 1024 * 1024;
+    let total_started = Instant::now();
+
+    let phase_started = Instant::now();
     let entry = resolve_runtime_entry_paths(wasm_path)?;
+    log_phase_duration(wasm_path, "resolve_entry", phase_started);
+
+    let phase_started = Instant::now();
     let meta = std::fs::metadata(&entry.wasm_path)
         .map_err(|_| LoadError::MissingWasm(entry.wasm_path.display().to_string()))?;
     if meta.len() > MAX_WASM_BYTES {
         return Err(LoadError::WasmLoad("wasm file exceeds size cap".into()));
     }
+    log_phase_duration(wasm_path, "stat_wasm", phase_started);
 
+    let phase_started = Instant::now();
     let manifest = load_manifest(&entry.manifest_path)?;
+    log_phase_duration(wasm_path, "manifest", phase_started);
+
+    let phase_started = Instant::now();
     validate_declared_scene_assets(&manifest, &entry.package_root)?;
+    log_phase_duration(wasm_path, "scene_asset_validation", phase_started);
     log::info!(
         "Loading slide '{:?}' from {} (package_root={} version={:?} author={:?})",
         manifest.name,
@@ -2426,39 +2629,68 @@ where
         manifest.author
     );
 
-    let engine = make_wasm_engine()?;
-    let module = Module::from_file(&engine, &entry.wasm_path)
+    let phase_started = Instant::now();
+    let module = Module::from_file(engine, &entry.wasm_path)
         .map_err(|e| LoadError::WasmLoad(e.to_string()))?;
+    log_phase_duration(wasm_path, "module_compile", phase_started);
+
+    let phase_started = Instant::now();
     let host_mesh_assets = build_host_mesh_asset_catalog(&manifest, &entry.package_root)?;
+    log_phase_duration(wasm_path, "mesh_asset_catalog", phase_started);
+
+    let phase_started = Instant::now();
     let host_scene_metadata = build_host_scene_metadata_catalog(&manifest, &entry.package_root)?;
+    log_phase_duration(wasm_path, "scene_metadata_catalog", phase_started);
+
+    let phase_started = Instant::now();
     let host_sounds = build_host_sound_catalog(&manifest, &entry.package_root)?;
+    log_phase_duration(wasm_path, "sound_catalog", phase_started);
 
     let slide_runtime_label = entry.wasm_path.display().to_string();
+    let phase_started = Instant::now();
     let (mut loaded, channel) = load_slide(
-        &engine,
+        engine,
         &module,
         &slide_runtime_label,
         host_mesh_assets,
         host_scene_metadata,
         host_sounds,
-        params_bytes,
+        slide_params_bytes,
     )?;
+    log_phase_duration(&slide_runtime_label, "runtime_load", phase_started);
+
+    let phase_started = Instant::now();
     let screen_background_scene = if loaded.spec.scene_space == SceneSpace::Screen2D {
         maybe_compile_screen_background_scene(&manifest, &entry.package_root)?
     } else {
         None
     };
+    log_phase_duration(
+        &slide_runtime_label,
+        "screen_background_scene",
+        phase_started,
+    );
+
+    let phase_started = Instant::now();
     let scene_compiled = if loaded.spec.scene_space == SceneSpace::Screen2D {
         false
     } else {
         maybe_compile_authored_scene(&mut loaded.spec, &manifest, &entry.package_root)?
     };
+    log_phase_duration(
+        &slide_runtime_label,
+        "authored_scene_compile",
+        phase_started,
+    );
+
+    let phase_started = Instant::now();
     apply_package_resource_overrides(
         &mut loaded.spec,
         &manifest,
         &entry.package_root,
         !scene_compiled,
     )?;
+    log_phase_duration(&slide_runtime_label, "resource_overrides", phase_started);
     loaded.shader_source_hint = (scene_compiled
         && loaded
             .spec
@@ -2476,6 +2708,7 @@ where
 
     let sidecar_path = entry.package_root.join(PACKAGE_SIDECAR_NAME);
     if sidecar_path.is_file() {
+        let phase_started = Instant::now();
         let sidecar_bytes = std::fs::read(&sidecar_path).map_err(|error| {
             LoadError::WasmLoad(format!(
                 "failed to read sidecar '{}': {error}",
@@ -2489,12 +2722,12 @@ where
             .unwrap_or_default();
         let sidecar_runtime_label = sidecar_path.display().to_string();
         let sidecar = load_sidecar_with_config(
-            &engine,
+            engine,
             &sidecar_bytes,
             channel,
             &sidecar_preopens,
             &sidecar_runtime_label,
-            params_bytes,
+            sidecar_params_bytes,
             extra_env,
         )?;
         if let Some(runtime) = loaded.runtime.as_mut() {
@@ -2506,14 +2739,50 @@ where
                 sidecar_path.display()
             );
         }
+        log_phase_duration(&slide_runtime_label, "sidecar", phase_started);
     }
 
+    log_phase_duration(&slide_runtime_label, "total_slide_load", total_started);
     Ok((loaded, manifest))
 }
 
+#[cfg(test)]
 pub(crate) fn load_slide_from_archive<V>(
     archive_path: &str,
     params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
+where
+    V: PackageMeshVertex,
+{
+    let engine = make_wasm_engine()?;
+    load_slide_from_archive_with_engine(&engine, archive_path, params_bytes, extra_env)
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_slide_from_archive_with_engine<V>(
+    engine: &Engine,
+    archive_path: &str,
+    params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
+where
+    V: PackageMeshVertex,
+{
+    load_slide_from_archive_with_engine_and_sidecar_params(
+        engine,
+        archive_path,
+        params_bytes,
+        params_bytes,
+        extra_env,
+    )
+}
+
+pub(crate) fn load_slide_from_archive_with_engine_and_sidecar_params<V>(
+    engine: &Engine,
+    archive_path: &str,
+    slide_params_bytes: Option<&[u8]>,
+    sidecar_params_bytes: Option<&[u8]>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
 where
@@ -2524,7 +2793,13 @@ where
             "'{archive_path}' is not a .{PACKAGE_ARCHIVE_EXTENSION} archive"
         )));
     }
-    load_slide_from_wasm(archive_path, params_bytes, extra_env)
+    load_slide_from_wasm_with_engine_and_sidecar_params(
+        engine,
+        archive_path,
+        slide_params_bytes,
+        sidecar_params_bytes,
+        extra_env,
+    )
 }
 
 pub fn pack_slide_directory(
@@ -3383,7 +3658,11 @@ where
                 };
                 let catalog = &caller.data().sound_catalog;
                 let Some(data) = catalog.by_key.get(&key) else {
-                    log::warn!("slide:{} audio_play: sound key '{}' not found", caller.data().label, key);
+                    log::warn!(
+                        "slide:{} audio_play: sound key '{}' not found",
+                        caller.data().label,
+                        key
+                    );
                     return HOST_ASSET_NOT_FOUND;
                 };
                 let data = data.clone();
@@ -3393,8 +3672,13 @@ where
                 let result = if let Ok(mut registry) = catalog.registry.lock() {
                     registry.play(id, &data, volume, looped)
                 } else {
-                    log::error!("slide:{} audio_play: failed to lock sound registry", caller.data().label);
-                    Err(crate::audio::AudioError::PlayError("registry lock failed".into()))
+                    log::error!(
+                        "slide:{} audio_play: failed to lock sound registry",
+                        caller.data().label
+                    );
+                    Err(crate::audio::AudioError::PlayError(
+                        "registry lock failed".into(),
+                    ))
                 };
 
                 if let Err(ref e) = result {
@@ -3525,9 +3809,11 @@ where
         )
         .map_err(|e| LoadError::WasmLoad(e.to_string()))?;
 
+    let instantiate_started = Instant::now();
     let instance = linker
         .instantiate(&mut store, module)
         .map_err(|e| LoadError::WasmLoad(e.to_string()))?;
+    log_phase_duration(runtime_label, "instantiate", instantiate_started);
     log::info!("slide:{} instantiated", store.data().label);
 
     // Run `_start` for WASI command-style modules so `main()` can populate the
@@ -3535,6 +3821,7 @@ where
     // code `0`; treat that as the normal clean-exit path and continue.
     if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
         log::info!("slide:{} invoking _start", store.data().label);
+        let start_started = Instant::now();
         match start.call(&mut store, ()) {
             Ok(()) => {}
             Err(e) => {
@@ -3546,10 +3833,13 @@ where
                 }
             }
         }
+        log_phase_duration(runtime_label, "_start", start_started);
         log::info!("slide:{} completed _start", store.data().label);
     }
 
+    let extract_started = Instant::now();
     let loaded = extract_spec(store, instance, params_bytes)?;
+    log_phase_duration(runtime_label, "extract_spec", extract_started);
     Ok((loaded, channel))
 }
 
@@ -3649,6 +3939,7 @@ where
             .get_typed_func::<i32, i32>(&mut *store, "vzglyd_configure")
             .ok();
         if let (Some(ptr_fn), Some(cap_fn), Some(cfg_fn)) = (ptr_fn, cap_fn, cfg_fn) {
+            let configure_started = Instant::now();
             let capacity = cap_fn
                 .call(&mut *store, ())
                 .map_err(|e| LoadError::WasmLoad(e.to_string()))?
@@ -3686,11 +3977,13 @@ where
                 "slide:{} vzglyd_configure({write_len}) -> {status}",
                 store.data().label
             );
+            log_phase_duration(&store.data().label, "vzglyd_configure", configure_started);
         }
     }
 
     if let Ok(init) = instance.get_typed_func::<(), i32>(&mut *store, "vzglyd_init") {
         log::info!("slide:{} invoking vzglyd_init", store.data().label);
+        let init_started = Instant::now();
         let mut trace = store.data().trace_recorder.clone().map(|recorder| {
             recorder.scoped(store.data().trace_thread.clone(), "runtime", "vzglyd_init")
         });
@@ -3704,6 +3997,7 @@ where
         let status =
             status.map_err(|error| LoadError::WasmLoad(format!("vzglyd_init failed: {error}")))?;
         log::info!("slide:{} vzglyd_init -> {status}", store.data().label);
+        log_phase_duration(&store.data().label, "vzglyd_init", init_started);
     }
 
     let ptr_fn = instance
@@ -3739,7 +4033,11 @@ where
             "unexpected wire version {wire_ver}"
         )));
     }
-    postcard::from_bytes(&data[1..]).map_err(|e| LoadError::SpecDecode(e.to_string()))
+    let decode_started = Instant::now();
+    let spec =
+        postcard::from_bytes(&data[1..]).map_err(|e| LoadError::SpecDecode(e.to_string()))?;
+    log_phase_duration(&store.data().label, "spec_postcard_decode", decode_started);
+    Ok(spec)
 }
 
 #[cfg(test)]
@@ -4652,7 +4950,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_configure_receives_playlist_params() {
+    fn sidecar_configure_receives_sidecar_params() {
         let engine = make_wasm_engine().expect("build test engine");
         let wasm = make_configurable_sidecar_test_wasm();
         let module = Module::new(&engine, &wasm).expect("compile configurable sidecar module");
@@ -5018,7 +5316,6 @@ mod tests {
         assert_eq!(directional.intensity, 1.5);
     }
 
-
     #[test]
     fn scene_compilation_still_uses_spec_budget_validation() {
         let package_dir = temp_package_dir("scene_compile_budget");
@@ -5352,9 +5649,12 @@ cp built/slide.wasm slide.wasm
         let (dir_loaded, _) =
             load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load directory package");
-        let (archive_loaded, _) =
-            load_slide_from_archive::<WorldVertex>(archive_path.to_string_lossy().as_ref(), None, &[])
-                .expect("load archive package");
+        let (archive_loaded, _) = load_slide_from_archive::<WorldVertex>(
+            archive_path.to_string_lossy().as_ref(),
+            None,
+            &[],
+        )
+        .expect("load archive package");
 
         assert_eq!(
             archive_loaded.spec.static_meshes[1].vertices[0].position,
@@ -5506,8 +5806,8 @@ cp built/slide.wasm slide.wasm
             params: None,
         };
 
-        let catalog = build_host_sound_catalog(&manifest, &package_dir)
-            .expect("catalog should load wav");
+        let catalog =
+            build_host_sound_catalog(&manifest, &package_dir).expect("catalog should load wav");
         assert_eq!(catalog.by_key.len(), 1);
         assert!(catalog.by_key.contains_key("click_sound"));
         assert_eq!(catalog.by_key["click_sound"], wav);
@@ -5711,8 +6011,8 @@ cp built/slide.wasm slide.wasm
             params: None,
         };
 
-        let catalog = build_host_sound_catalog(&manifest, &package_dir)
-            .expect("catalog should succeed");
+        let catalog =
+            build_host_sound_catalog(&manifest, &package_dir).expect("catalog should succeed");
         assert!(catalog.by_key.contains_key("tone"));
         // Registry should be initialised and empty
         let registry = catalog.registry.lock().expect("lock registry");
@@ -5752,17 +6052,20 @@ cp built/slide.wasm slide.wasm
         .expect("write manifest");
         std::fs::write(package_dir.join(PACKAGE_WASM_NAME), &wasm).expect("write wasm");
 
-        let (loaded, _manifest) = load_slide_from_wasm::<WorldVertex>(
-            package_dir.to_string_lossy().as_ref(),
-            None,
-            &[],
-        )
-        .expect("load slide with sound");
+        let (loaded, _manifest) =
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
+                .expect("load slide with sound");
 
         // The loaded slide store should have the sound asset
         let catalog = &loaded.runtime.as_ref().unwrap().store.data().sound_catalog;
-        assert!(catalog.by_key.contains_key("tone"), "sound 'tone' should be in catalog");
-        assert_eq!(catalog.by_key["tone"], wav, "sound data should match original WAV");
+        assert!(
+            catalog.by_key.contains_key("tone"),
+            "sound 'tone' should be in catalog"
+        );
+        assert_eq!(
+            catalog.by_key["tone"], wav,
+            "sound data should match original WAV"
+        );
     }
 
     #[test]
@@ -5798,12 +6101,9 @@ cp built/slide.wasm slide.wasm
         .expect("write manifest");
         std::fs::write(package_dir.join(PACKAGE_WASM_NAME), &wasm).expect("write wasm");
 
-        let (loaded, _manifest) = load_slide_from_wasm::<WorldVertex>(
-            package_dir.to_string_lossy().as_ref(),
-            None,
-            &[],
-        )
-        .expect("load slide with multiple sounds");
+        let (loaded, _manifest) =
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
+                .expect("load slide with multiple sounds");
 
         let catalog = &loaded.runtime.as_ref().unwrap().store.data().sound_catalog;
         assert_eq!(catalog.by_key.len(), 2);

@@ -9,18 +9,18 @@
 //! - rodio for audio playback
 
 pub mod app;
-pub mod server;
 pub mod assets;
+pub mod audio;
 pub mod gpu;
 pub mod render;
+pub mod server;
 pub mod slide;
 pub mod slide_loader;
 pub mod trace;
 pub mod utils;
 pub mod wasm;
-pub mod audio;
 
 pub use app::NativeApp;
+pub use audio::{AudioEngine, SoundRegistry};
 pub use gpu::GpuContext;
 pub use wasm::WasmRuntime;
-pub use audio::{AudioEngine, SoundRegistry};

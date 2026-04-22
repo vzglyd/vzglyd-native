@@ -60,6 +60,7 @@ function normalizeEntry(e, i) {
   const to = normalizeOptionalTransition(e.transition_out, `slides[${i}].transition_out`);
   if (to != null) out.transition_out = to;
   if (e.params !== undefined) out.params = e.params;
+  if (e.sidecar_params !== undefined) out.sidecar_params = e.sidecar_params;
   return out;
 }
 
@@ -94,6 +95,7 @@ function toEditablePlaylist(playlist) {
       params_form_values: {},
       params_schema: null,
       params_editor_message: '',
+      sidecar_params_text: e.sidecar_params !== undefined ? JSON.stringify(e.sidecar_params, null, 2) : '',
       bundle_manifest: null,
       bundle_manifest_status: 'idle',
       bundle_error: '',
@@ -105,7 +107,8 @@ function emptyEditableEntry() {
   return {
     path: '', enabled: true, duration_seconds: '', transition_in: '', transition_out: '',
     params_text: '', params_editor_mode: 'raw', params_form_values: {}, params_schema: null,
-    params_editor_message: '', bundle_manifest: null, bundle_manifest_status: 'idle', bundle_error: '',
+    params_editor_message: '', sidecar_params_text: '',
+    bundle_manifest: null, bundle_manifest_status: 'idle', bundle_error: '',
   };
 }
 
@@ -129,6 +132,8 @@ function serializeEditablePlaylist(ep) {
     if (eto != null) item.transition_out = eto;
     const params = parseParamsText(e.params_text);
     if (params !== undefined) item.params = params;
+    const sidecarParams = parseParamsText(e.sidecar_params_text);
+    if (sidecarParams !== undefined) item.sidecar_params = sidecarParams;
     return item;
   });
 
@@ -521,6 +526,16 @@ function renderEntries() {
     paramsArea.value = entry.params_text;
     paramsLabel.append(paramsArea);
     paramsShell.append(paramsLabel);
+
+    const sidecarParamsLabel = document.createElement('label');
+    sidecarParamsLabel.className = 'field is-wide';
+    sidecarParamsLabel.innerHTML = '<span>Sidecar params JSON</span>';
+    const sidecarParamsArea = document.createElement('textarea');
+    sidecarParamsArea.dataset.field = 'sidecar_params_text';
+    sidecarParamsArea.placeholder = '{\n  "api_key": "..." \n}';
+    sidecarParamsArea.value = entry.sidecar_params_text ?? '';
+    sidecarParamsLabel.append(sidecarParamsArea);
+    paramsShell.append(sidecarParamsLabel);
 
     card.append(topLine, summary, grid, paramsShell);
     entryList.append(card);

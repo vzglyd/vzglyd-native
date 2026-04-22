@@ -246,4 +246,3 @@ impl SlideInstance {
         &mut self.store
     }
 }
-

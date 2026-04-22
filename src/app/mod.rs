@@ -6,14 +6,15 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use vzglyd_kernel::SecretsStore;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use vzglyd_kernel::TransitionKind as KernelTransitionKind;
 use vzglyd_kernel::InfoReason;
+use vzglyd_kernel::SecretsStore;
+use vzglyd_kernel::TransitionKind as KernelTransitionKind;
 use vzglyd_kernel::schedule::{PLAYLIST_FILENAME, Playlist, parse_playlist};
 use vzglyd_kernel::{
     Engine, EngineConfig, EngineInput, FrameRenderState, Host, LogLevel, RenderCommand, SlideEntry,
@@ -33,11 +34,12 @@ use winit::platform::x11::{
 use crate::gpu::context::{GpuContext, HEIGHT, OffscreenTarget, WIDTH};
 use crate::render::{
     LoadedSlide, OverlayRenderer, SlideRenderer, TransitionKind, TransitionRenderer,
-    create_loaded_slide_renderer, load_wasm_slide, load_wasm_slide_from_bytes,
+    create_loaded_slide_renderer, load_wasm_slide_from_bytes,
+    load_wasm_slide_with_engine_and_sidecar_params,
 };
 use crate::server::{AppStatus, start_server};
-use vzglyd_kernel::manifest::SlideManifest;
 use crate::trace::set_active_trace_recorder;
+use vzglyd_kernel::manifest::SlideManifest;
 
 const LOADING_SCENE_PATH: &str = "$loading";
 const LOADING_SLIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/loading.vzglyd"));
@@ -59,6 +61,7 @@ pub struct RunConfig {
 struct ScheduledSlide {
     path: String,
     params: Option<serde_json::Value>,
+    sidecar_params: Option<serde_json::Value>,
 }
 
 struct PendingSlide {
@@ -240,12 +243,17 @@ impl NativeApp {
             match crate::server::load_secrets(std::path::Path::new(dir)) {
                 Ok(secrets) => {
                     if !secrets.is_empty() {
-                        eprintln!("[vzglyd] loaded {} secret(s) from secrets.json", secrets.len());
+                        eprintln!(
+                            "[vzglyd] loaded {} secret(s) from secrets.json",
+                            secrets.len()
+                        );
                     }
                     // Safety: single-threaded at this point (before EventLoop::run_app).
                     for (key, val) in &secrets.0 {
                         #[allow(unused_unsafe)]
-                        unsafe { std::env::set_var(key, val) };
+                        unsafe {
+                            std::env::set_var(key, val)
+                        };
                     }
                     if let Ok(mut guard) = app.secrets.write() {
                         *guard = secrets;
@@ -278,7 +286,8 @@ impl NativeApp {
                     let url = management_console_url();
                     let reason = match info_reason {
                         InfoReason::MissingPlaylist { .. } => {
-                            let slides_dir = app.run_config.slides_dir.as_deref().unwrap_or("slides");
+                            let slides_dir =
+                                app.run_config.slides_dir.as_deref().unwrap_or("slides");
                             vzglyd_kernel::missing_playlist_info(slides_dir, &url)
                         }
                         InfoReason::InvalidPlaylist { error, .. } => {
@@ -287,9 +296,7 @@ impl NativeApp {
                         InfoReason::EmptyPlaylist { .. } => {
                             vzglyd_kernel::empty_playlist_info(&url)
                         }
-                        InfoReason::Alert { title, lines } => {
-                            InfoReason::Alert { title, lines }
-                        }
+                        InfoReason::Alert { title, lines } => InfoReason::Alert { title, lines },
                     };
                     engine.show_info_slide(reason);
                     engine.set_slides_dir(app.run_config.slides_dir.as_deref().unwrap_or("slides"));
@@ -445,8 +452,12 @@ impl NativeApp {
 
     /// Update the overlay text lines from the kernel's current InfoReason.
     fn update_info_overlay_text(&mut self) {
-        let Some(engine) = self.engine.as_ref() else { return };
-        let Some(reason) = engine.info_reason() else { return };
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let Some(reason) = engine.info_reason() else {
+            return;
+        };
 
         let mut lines = vec![reason.primary_message()];
         lines.extend(reason.detail_lines());
@@ -470,10 +481,7 @@ impl NativeApp {
         let slides = self.slides.clone();
         let secrets = Arc::clone(&self.secrets);
 
-        eprintln!(
-            "[vzglyd] spawning background loader for {} slide(s)",
-            slides.len()
-        );
+        let worker_count = loader_worker_count(slides.len());
 
         std::thread::spawn(move || {
             // Snapshot secrets once for this loader batch.
@@ -481,13 +489,83 @@ impl NativeApp {
                 .read()
                 .map(|s| s.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
-            for (idx, slide) in slides.iter().enumerate() {
-                eprintln!("[loader] {}/{}: {}", idx + 1, slides.len(), slide.path);
-                let result = load_slide_package(idx, slide, &extra_env);
-                let send_result = tx.send(result);
-                if send_result.is_err() {
-                    // Main thread dropped the receiver — exit early.
+
+            let total = slides.len();
+            eprintln!(
+                "[vzglyd] spawning background loader for {} slide(s) with {} worker(s)",
+                total, worker_count
+            );
+
+            let engine = match crate::slide_loader::make_wasm_engine() {
+                Ok(engine) => engine,
+                Err(error) => {
+                    for (idx, slide) in slides.into_iter().enumerate() {
+                        if tx
+                            .send(Err((
+                                idx,
+                                slide.path,
+                                format!("failed to create shared Wasmtime engine: {error}"),
+                            )))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    return;
+                }
+            };
+
+            let (job_tx, job_rx) = mpsc::channel();
+            for (idx, slide) in slides.into_iter().enumerate() {
+                if job_tx.send((idx, slide)).is_err() {
                     break;
+                }
+            }
+            drop(job_tx);
+
+            let job_rx = Arc::new(Mutex::new(job_rx));
+            let extra_env = Arc::new(extra_env);
+            let mut workers = Vec::with_capacity(worker_count);
+            for worker_idx in 0..worker_count {
+                let job_rx = Arc::clone(&job_rx);
+                let tx = tx.clone();
+                let extra_env = Arc::clone(&extra_env);
+                let engine = engine.clone();
+                let worker = std::thread::Builder::new()
+                    .name(format!("VRX-64-slide-loader-{worker_idx}"))
+                    .spawn(move || {
+                        loop {
+                            let job = {
+                                let rx = job_rx
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                rx.recv()
+                            };
+                            let Ok((idx, slide)) = job else { break };
+                            eprintln!("[loader] {}/{}: {}", idx + 1, total, slide.path);
+                            let result = load_slide_package_with_engine(
+                                idx,
+                                &slide,
+                                extra_env.as_slice(),
+                                &engine,
+                            );
+                            if tx.send(result).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                match worker {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => {
+                        log::error!("[loader] failed to spawn worker {worker_idx}: {error}");
+                    }
+                }
+            }
+            drop(tx);
+
+            for worker in workers {
+                if let Err(error) = worker.join() {
+                    log::warn!("[loader] worker thread panicked: {error:?}");
                 }
             }
             log::info!("[loader] all slides compiled");
@@ -509,28 +587,35 @@ impl NativeApp {
                         pending.idx,
                         pending.package.path
                     );
-                    while self.slide_renderers.len() <= pending.idx {
-                        self.slide_renderers.push(None);
-                    }
                     let manifest = pending.package.manifest;
+                    let render_started = Instant::now();
                     match create_loaded_slide_renderer(ctx, pending.package.slide) {
                         Ok(renderer) => {
-                            self.slide_renderers[pending.idx] = Some(LoadedSlideRenderer {
-                                renderer,
-                                manifest: manifest.clone(),
-                            });
+                            store_indexed_slot(
+                                &mut self.slide_renderers,
+                                pending.idx,
+                                LoadedSlideRenderer {
+                                    renderer,
+                                    manifest: manifest.clone(),
+                                },
+                            );
                             if let Some(engine) = &mut self.engine {
                                 engine.apply_manifest_metadata(
                                     pending.idx,
                                     manifest_schedule_metadata(manifest.as_ref()),
                                 );
                             }
-                            log::info!("[main] slide {} ready", pending.idx);
+                            log::info!(
+                                "[main] slide {} ready; renderer_create took {:.1}ms",
+                                pending.idx,
+                                render_started.elapsed().as_secs_f64() * 1000.0
+                            );
                             any = true;
                         }
                         Err(e) => log::error!(
-                            "[main] renderer creation failed for slide {}: {}",
+                            "[main] renderer creation failed for slide {} after {:.1}ms: {}",
                             pending.idx,
+                            render_started.elapsed().as_secs_f64() * 1000.0,
                             e
                         ),
                     }
@@ -587,7 +672,10 @@ impl NativeApp {
 
         match vzglyd_kernel::schedule::parse_playlist(json.as_bytes()) {
             Ok(playlist) => {
-                log::info!("[hot-reload] applying new playlist ({} slides)", playlist.slides.len());
+                log::info!(
+                    "[hot-reload] applying new playlist ({} slides)",
+                    playlist.slides.len()
+                );
 
                 if let Some(mut engine) = self.engine.take() {
                     engine.set_schedule_from_playlist(&playlist, slides_dir);
@@ -620,7 +708,9 @@ impl NativeApp {
             return;
         }
 
-        let Some(engine) = self.engine.as_mut() else { return };
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
 
         if !engine.poll_info_recovery() {
             return;
@@ -651,7 +741,9 @@ impl NativeApp {
                             ));
                         }
                         InfoReason::InvalidPlaylist { error, .. } => {
-                            engine.show_info_slide(vzglyd_kernel::invalid_playlist_info(&error, &url));
+                            engine.show_info_slide(vzglyd_kernel::invalid_playlist_info(
+                                &error, &url,
+                            ));
                         }
                         InfoReason::EmptyPlaylist { .. } => {
                             engine.show_info_slide(vzglyd_kernel::empty_playlist_info(&url));
@@ -677,16 +769,13 @@ impl NativeApp {
             self.fps_frame_count = 0;
             self.fps_window_start = Some(now);
 
-            let current_slide = self
-                .slides
-                .first()
-                .map(|s| {
-                    std::path::Path::new(&s.path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&s.path)
-                        .to_string()
-                });
+            let current_slide = self.slides.first().map(|s| {
+                std::path::Path::new(&s.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&s.path)
+                    .to_string()
+            });
 
             if let Ok(mut status) = self.app_status.write() {
                 status.fps = fps;
@@ -790,8 +879,12 @@ impl NativeApp {
 
         let result = {
             let Some(ctx) = &self.context else { return };
-            let Some(target) = self.info_target.as_ref() else { return };
-            let Some(renderer) = self.info_renderer.as_mut() else { return };
+            let Some(target) = self.info_target.as_ref() else {
+                return;
+            };
+            let Some(renderer) = self.info_renderer.as_mut() else {
+                return;
+            };
 
             renderer.renderer.set_active(true);
             Self::update_and_render_renderer(renderer, ctx, target, dt);
@@ -1103,10 +1196,11 @@ impl Drop for NativeApp {
 // Background loading helpers
 // ---------------------------------------------------------------------------
 
-fn load_slide_package(
+fn load_slide_package_with_engine(
     idx: usize,
     slide: &ScheduledSlide,
     extra_env: &[(String, String)],
+    wasm_engine: &wasmtime::Engine,
 ) -> SlideLoadResult {
     macro_rules! bail {
         ($msg:expr) => {
@@ -1118,13 +1212,34 @@ fn load_slide_package(
         .params
         .as_ref()
         .map(|value| serde_json::to_vec(value).expect("params serialization is infallible"));
-    let (loaded, manifest) = match load_wasm_slide(&slide.path, params_bytes.as_deref(), extra_env) {
+    let sidecar_params_bytes = slide.sidecar_params.as_ref().map(|value| {
+        serde_json::to_vec(value).expect("sidecar params serialization is infallible")
+    });
+    let load_started = Instant::now();
+    let (loaded, manifest) = match load_wasm_slide_with_engine_and_sidecar_params(
+        wasm_engine,
+        &slide.path,
+        params_bytes.as_deref(),
+        sidecar_params_bytes.as_deref(),
+        extra_env,
+    ) {
         Ok(loaded) => loaded,
         Err(error) => bail!(format!("slide load failed: {error}")),
     };
+    log::info!(
+        "[loader:timing] {} load_wasm_slide took {:.1}ms",
+        slide.path,
+        load_started.elapsed().as_secs_f64() * 1000.0
+    );
+    let validate_started = Instant::now();
     if let Err(error) = loaded.validate() {
         bail!(format!("slide validation failed: {error}"));
     }
+    log::info!(
+        "[loader:timing] {} validate took {:.1}ms",
+        slide.path,
+        validate_started.elapsed().as_secs_f64() * 1000.0
+    );
 
     Ok(PendingSlide {
         idx,
@@ -1134,6 +1249,46 @@ fn load_slide_package(
             path: slide.path.clone(),
         },
     })
+}
+
+fn loader_worker_count(slide_count: usize) -> usize {
+    if slide_count == 0 {
+        return 0;
+    }
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(2)
+        .max(1);
+    let requested = std::env::var("VZGLYD_LOADER_JOBS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| default_loader_worker_count(available));
+    requested.min(available).min(slide_count).max(1)
+}
+
+fn default_loader_worker_count(available: usize) -> usize {
+    if running_on_raspberry_pi() {
+        return 2.min(available).max(1);
+    }
+    available.min(4).max(1)
+}
+
+fn running_on_raspberry_pi() -> bool {
+    [
+        "/proc/device-tree/model",
+        "/sys/firmware/devicetree/base/model",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .any(|model| model.to_ascii_lowercase().contains("raspberry pi"))
+}
+
+fn store_indexed_slot<T>(slots: &mut Vec<Option<T>>, idx: usize, value: T) {
+    if slots.len() <= idx {
+        slots.resize_with(idx + 1, || None);
+    }
+    slots[idx] = Some(value);
 }
 
 fn resolve_trace_output_path(run_config: &RunConfig) -> PathBuf {
@@ -1227,6 +1382,7 @@ fn schedule_snapshot(engine: &Engine) -> Vec<ScheduledSlide> {
         .map(|entry: &SlideEntry| ScheduledSlide {
             path: entry.path.clone(),
             params: entry.params.clone(),
+            sidecar_params: entry.sidecar_params.clone(),
         })
         .collect()
 }
@@ -1259,21 +1415,18 @@ fn load_schedule(
         });
     }
 
-    let bytes = std::fs::read(&playlist_path)
-        .map_err(|error| InfoReason::InvalidPlaylist {
-            error: format!("failed to read {}: {}", playlist_path.display(), error),
-            management_url: String::new(),
-        })?;
-    let playlist = parse_playlist(&bytes)
-        .map_err(|error| InfoReason::InvalidPlaylist {
-            error: format!("invalid {}: {}", playlist_path.display(), error),
-            management_url: String::new(),
-        })?;
-    validate_shared_repo_playlist(&playlist)
-        .map_err(|error| InfoReason::InvalidPlaylist {
-            error: format!("invalid {}: {}", playlist_path.display(), error),
-            management_url: String::new(),
-        })?;
+    let bytes = std::fs::read(&playlist_path).map_err(|error| InfoReason::InvalidPlaylist {
+        error: format!("failed to read {}: {}", playlist_path.display(), error),
+        management_url: String::new(),
+    })?;
+    let playlist = parse_playlist(&bytes).map_err(|error| InfoReason::InvalidPlaylist {
+        error: format!("invalid {}: {}", playlist_path.display(), error),
+        management_url: String::new(),
+    })?;
+    validate_shared_repo_playlist(&playlist).map_err(|error| InfoReason::InvalidPlaylist {
+        error: format!("invalid {}: {}", playlist_path.display(), error),
+        management_url: String::new(),
+    })?;
 
     let display_scale = playlist.display_scale;
     engine.set_schedule_from_playlist(&playlist, slides_dir);
@@ -1458,6 +1611,29 @@ mod tests {
         });
         assert_eq!(path, PathBuf::from("/tmp/custom.perfetto.json"));
     }
+
+    #[test]
+    fn loader_worker_count_is_bounded_by_slide_count() {
+        assert_eq!(loader_worker_count(0), 0);
+        assert_eq!(loader_worker_count(1), 1);
+
+        let available = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(2)
+            .max(1);
+        let count = loader_worker_count(usize::MAX);
+        assert!(count >= 1);
+        assert!(count <= available);
+    }
+
+    #[test]
+    fn indexed_slot_storage_preserves_completion_indices() {
+        let mut slots = Vec::new();
+        store_indexed_slot(&mut slots, 2, "third");
+        store_indexed_slot(&mut slots, 0, "first");
+
+        assert_eq!(slots, vec![Some("first"), None, Some("third")]);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1561,7 +1737,11 @@ impl ApplicationHandler for NativeApp {
         }
 
         // If the kernel has an info slide active, initialize the info renderer.
-        if self.engine.as_ref().is_some_and(|e| e.info_reason().is_some()) {
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|e| e.info_reason().is_some())
+        {
             self.try_init_info_renderer();
             self.update_info_overlay_text();
         }

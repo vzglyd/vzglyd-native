@@ -68,21 +68,21 @@ impl AudioEngine {
     ///
     /// Returns a [`SoundHandle`] that owns the rodio [`Sink`] for this instance.
     pub fn play(&self, data: &[u8], volume: f32, looped: bool) -> Result<SoundHandle, AudioError> {
-        let sink = Sink::try_new(&self.stream_handle)
-            .map_err(|e| AudioError::PlayError(e.to_string()))?;
+        let sink =
+            Sink::try_new(&self.stream_handle).map_err(|e| AudioError::PlayError(e.to_string()))?;
 
         sink.set_volume(volume.clamp(0.0, 1.0));
 
         if looped {
             let cursor = Cursor::new(data.to_vec());
-            let source = Decoder::new(cursor)
-                .map_err(|e| AudioError::DecodeError(e.to_string()))?;
+            let source =
+                Decoder::new(cursor).map_err(|e| AudioError::DecodeError(e.to_string()))?;
             let looped_source = source.repeat_infinite();
             sink.append(looped_source);
         } else {
             let cursor = Cursor::new(data.to_vec());
-            let source = Decoder::new(cursor)
-                .map_err(|e| AudioError::DecodeError(e.to_string()))?;
+            let source =
+                Decoder::new(cursor).map_err(|e| AudioError::DecodeError(e.to_string()))?;
             sink.append(source);
         }
 
@@ -136,7 +136,9 @@ impl SoundHandle {
 
     /// Check if the sound is still playing.
     pub fn is_playing(&self) -> bool {
-        let Ok(sink) = self.sink.lock() else { return false };
+        let Ok(sink) = self.sink.lock() else {
+            return false;
+        };
         !sink.empty() && !sink.is_paused()
     }
 }
@@ -399,7 +401,10 @@ mod tests {
         let wav = make_test_wav();
 
         let result = registry.play(1, &wav, 0.5, false);
-        assert!(result.is_ok(), "play should succeed with valid WAV: {result:?}");
+        assert!(
+            result.is_ok(),
+            "play should succeed with valid WAV: {result:?}"
+        );
 
         // Sound should be registered
         assert!(registry.sounds.contains_key(&1));
@@ -587,7 +592,9 @@ mod tests {
     fn play_looped_sound_succeeds() {
         let wav = make_test_wav();
         let engine = AudioEngine::global().expect("audio engine should be available");
-        let handle = engine.play(&wav, 0.5, true).expect("looped play should succeed");
+        let handle = engine
+            .play(&wav, 0.5, true)
+            .expect("looped play should succeed");
 
         // Give the audio thread a moment to start
         std::thread::sleep(std::time::Duration::from_millis(50));
