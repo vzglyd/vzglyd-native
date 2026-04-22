@@ -31,6 +31,9 @@ cargo run -- --slides-dir slides/ -v
 # Run a single bundle with tracing enabled
 cargo run -- --trace --scene /path/to/slide.vzglyd
 
+# Run a single bundle with a watched JSON result file
+cargo run -- --scene /path/to/slide.vzglyd --data-path /tmp/weather.out.json
+
 # Write the trace to a specific file
 cargo run -- --trace --trace-out /tmp/slide.perfetto.json --scene /path/to/slide.vzglyd
 
@@ -47,7 +50,8 @@ Startup preload tuning:
 
 The native host now expects `--slides-dir` to point at a shared slide repository root.
 That repo must contain a required `playlist.json`, and each playlist entry path must be
-repo-root-relative and point to a `.vzglyd` bundle.
+repo-root-relative and point to a `.vzglyd` bundle. Slides may also declare a
+per-entry `data_path` that points at a watched JSON result file.
 
 ### Repo Layout
 
@@ -56,12 +60,36 @@ slides/
 ├── playlist.json
 ├── clock.vzglyd
 ├── weather.vzglyd
+├── data/
+│   └── weather.out.json
 └── daily/
     └── headlines.vzglyd
 ```
 
 Missing or invalid `playlist.json` is treated as a startup error. Use `--scene <PATH>`
 when you want to run one bundle directly without the shared repo contract.
+`--data-path <PATH>` is available in that mode as well; relative paths resolve
+from the bundle's parent directory.
+
+### `data_path`
+
+Each playlist entry may include:
+
+```json
+{
+  "path": "weather.vzglyd",
+  "data_path": "/home/rodgerbenham/.brrmmmm/missions/weather/weather.out.json"
+}
+```
+
+`data_path` accepts:
+
+- an absolute filesystem path
+- a path relative to the slides repo root
+
+The host watches the file, requires valid JSON before publishing an update, and
+forwards the full file bytes into the slide mailbox ABI (`channel_poll`).
+The intended producer is a durable `brrmmmm` `.out.json` result file.
 
 ## Tracing
 

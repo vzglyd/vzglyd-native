@@ -35,7 +35,7 @@ use crate::gpu::context::{GpuContext, HEIGHT, OffscreenTarget, WIDTH};
 use crate::render::{
     LoadedSlide, OverlayRenderer, SlideRenderer, TransitionKind, TransitionRenderer,
     create_loaded_slide_renderer, load_wasm_slide_from_bytes,
-    load_wasm_slide_with_engine_and_sidecar_params,
+    load_wasm_slide_with_engine_and_data_path,
 };
 use crate::server::{AppStatus, start_server};
 use crate::trace::set_active_trace_recorder;
@@ -53,6 +53,7 @@ static SHUTDOWN_SIGNAL_HANDLERS: OnceLock<()> = OnceLock::new();
 pub struct RunConfig {
     pub slides_dir: Option<String>,
     pub scene_path: Option<String>,
+    pub data_path: Option<String>,
     pub trace: bool,
     pub trace_out: Option<String>,
 }
@@ -60,8 +61,8 @@ pub struct RunConfig {
 #[derive(Clone, Debug)]
 struct ScheduledSlide {
     path: String,
+    data_path: Option<String>,
     params: Option<serde_json::Value>,
-    sidecar_params: Option<serde_json::Value>,
 }
 
 struct PendingSlide {
@@ -108,7 +109,7 @@ pub struct NativeApp {
     pending_rx: Option<Receiver<SlideLoadResult>>,
     trace_recorder: Option<vzglyd_kernel::trace::TraceRecorder>,
     shutdown_requested: Arc<AtomicBool>,
-    /// Secrets (API keys etc.) injected into sidecar WASI environments.
+    /// Secrets (API keys etc.) loaded for local management and slide-adjacent tooling.
     pub secrets: Arc<RwLock<SecretsStore>>,
     /// Receives new playlist JSON from the management server for hot-reload.
     playlist_reload_rx: Option<Receiver<String>>,
@@ -1212,15 +1213,12 @@ fn load_slide_package_with_engine(
         .params
         .as_ref()
         .map(|value| serde_json::to_vec(value).expect("params serialization is infallible"));
-    let sidecar_params_bytes = slide.sidecar_params.as_ref().map(|value| {
-        serde_json::to_vec(value).expect("sidecar params serialization is infallible")
-    });
     let load_started = Instant::now();
-    let (loaded, manifest) = match load_wasm_slide_with_engine_and_sidecar_params(
+    let (loaded, manifest) = match load_wasm_slide_with_engine_and_data_path(
         wasm_engine,
         &slide.path,
         params_bytes.as_deref(),
-        sidecar_params_bytes.as_deref(),
+        slide.data_path.as_deref(),
         extra_env,
     ) {
         Ok(loaded) => loaded,
@@ -1381,8 +1379,8 @@ fn schedule_snapshot(engine: &Engine) -> Vec<ScheduledSlide> {
         .iter()
         .map(|entry: &SlideEntry| ScheduledSlide {
             path: entry.path.clone(),
+            data_path: entry.data_path.clone(),
             params: entry.params.clone(),
-            sidecar_params: None,
         })
         .collect()
 }
@@ -1396,7 +1394,18 @@ fn load_schedule(
 ) -> Result<(Vec<ScheduledSlide>, f32), InfoReason> {
     if let Some(scene_path) = run_config.scene_path.as_ref() {
         eprintln!("[vzglyd] single-scene mode: {scene_path}");
-        engine.set_schedule(vec![scene_path.clone()]);
+        let data_path = run_config
+            .data_path
+            .as_deref()
+            .map(|path| resolve_scene_data_path(scene_path, path));
+        engine.set_resolved_schedule(vec![vzglyd_kernel::schedule::ResolvedSlideEntry {
+            path: scene_path.clone(),
+            data_path,
+            duration_secs: EngineConfig::default().default_duration_secs,
+            transition_in: None,
+            transition_out: None,
+            params: None,
+        }]);
         return Ok((schedule_snapshot(engine), 1.0));
     }
 
@@ -1448,6 +1457,10 @@ fn validate_shared_repo_playlist(playlist: &Playlist) -> Result<(), String> {
     for (index, entry) in playlist.slides.iter().enumerate() {
         validate_shared_repo_bundle_path(&entry.path)
             .map_err(|error| format!("slides[{index}].path {}", error))?;
+        if let Some(data_path) = entry.data_path.as_deref() {
+            validate_data_path(data_path)
+                .map_err(|error| format!("slides[{index}].data_path {}", error))?;
+        }
     }
     Ok(())
 }
@@ -1472,6 +1485,41 @@ fn validate_shared_repo_bundle_path(path: &str) -> Result<(), String> {
         return Err("must point to a .vzglyd bundle".into());
     }
     Ok(())
+}
+
+fn validate_data_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("must be a non-empty string".into());
+    }
+    if path.contains('\\') {
+        return Err("must use forward slashes".into());
+    }
+
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return Ok(());
+    }
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err("must not contain '.' or '..' path segments".into());
+    }
+    Ok(())
+}
+
+fn resolve_scene_data_path(scene_path: &str, data_path: &str) -> String {
+    let candidate = Path::new(data_path);
+    if candidate.is_absolute() {
+        return data_path.to_string();
+    }
+
+    Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(candidate)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,6 +1640,7 @@ mod tests {
         let path = resolve_trace_output_path(&RunConfig {
             slides_dir: None,
             scene_path: Some("/slides/air_quality.vzglyd".to_string()),
+            data_path: None,
             trace: true,
             trace_out: None,
         });
@@ -1606,6 +1655,7 @@ mod tests {
         let path = resolve_trace_output_path(&RunConfig {
             slides_dir: Some("slides".to_string()),
             scene_path: None,
+            data_path: None,
             trace: true,
             trace_out: Some("/tmp/custom.perfetto.json".to_string()),
         });

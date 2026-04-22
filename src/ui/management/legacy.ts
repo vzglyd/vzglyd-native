@@ -37,6 +37,16 @@ function validateBundlePath(path, label = 'path') {
   return t;
 }
 
+function validateDataPath(path, label = 'data_path') {
+  if (path == null || String(path).trim() === '') return undefined;
+  const t = String(path).trim();
+  if (t.includes('\\')) throw new Error(`${label} must use forward slashes`);
+  if (!t.startsWith('/') && t.split('/').some(s => s === '.' || s === '..')) {
+    throw new Error(`${label} must not contain . or .. segments`);
+  }
+  return t;
+}
+
 function normalizeDefaults(d) {
   if (!d) return {};
   const out = {};
@@ -60,7 +70,8 @@ function normalizeEntry(e, i) {
   const to = normalizeOptionalTransition(e.transition_out, `slides[${i}].transition_out`);
   if (to != null) out.transition_out = to;
   if (e.params !== undefined) out.params = e.params;
-  if (e.sidecar_params !== undefined) out.sidecar_params = e.sidecar_params;
+  const dataPath = validateDataPath(e.data_path, `slides[${i}].data_path`);
+  if (dataPath !== undefined) out.data_path = dataPath;
   return out;
 }
 
@@ -95,7 +106,7 @@ function toEditablePlaylist(playlist) {
       params_form_values: {},
       params_schema: null,
       params_editor_message: '',
-      sidecar_params_text: e.sidecar_params !== undefined ? JSON.stringify(e.sidecar_params, null, 2) : '',
+      data_path: e.data_path ?? '',
       bundle_manifest: null,
       bundle_manifest_status: 'idle',
       bundle_error: '',
@@ -107,7 +118,7 @@ function emptyEditableEntry() {
   return {
     path: '', enabled: true, duration_seconds: '', transition_in: '', transition_out: '',
     params_text: '', params_editor_mode: 'raw', params_form_values: {}, params_schema: null,
-    params_editor_message: '', sidecar_params_text: '',
+    params_editor_message: '', data_path: '',
     bundle_manifest: null, bundle_manifest_status: 'idle', bundle_error: '',
   };
 }
@@ -132,8 +143,8 @@ function serializeEditablePlaylist(ep) {
     if (eto != null) item.transition_out = eto;
     const params = parseParamsText(e.params_text);
     if (params !== undefined) item.params = params;
-    const sidecarParams = parseParamsText(e.sidecar_params_text);
-    if (sidecarParams !== undefined) item.sidecar_params = sidecarParams;
+    const dataPath = validateDataPath(e.data_path, `slides[${i}].data_path`);
+    if (dataPath !== undefined) item.data_path = dataPath;
     return item;
   });
 
@@ -527,15 +538,16 @@ function renderEntries() {
     paramsLabel.append(paramsArea);
     paramsShell.append(paramsLabel);
 
-    const sidecarParamsLabel = document.createElement('label');
-    sidecarParamsLabel.className = 'field is-wide';
-    sidecarParamsLabel.innerHTML = '<span>Sidecar params JSON</span>';
-    const sidecarParamsArea = document.createElement('textarea');
-    sidecarParamsArea.dataset.field = 'sidecar_params_text';
-    sidecarParamsArea.placeholder = '{\n  "api_key": "..." \n}';
-    sidecarParamsArea.value = entry.sidecar_params_text ?? '';
-    sidecarParamsLabel.append(sidecarParamsArea);
-    paramsShell.append(sidecarParamsLabel);
+    const dataPathLabel = document.createElement('label');
+    dataPathLabel.className = 'field is-wide';
+    dataPathLabel.innerHTML = '<span>Watched data file</span>';
+    const dataPathInput = document.createElement('input');
+    dataPathInput.type = 'text';
+    dataPathInput.dataset.field = 'data_path';
+    dataPathInput.placeholder = '/tmp/weather.out.json or data/weather.out.json';
+    dataPathInput.value = entry.data_path ?? '';
+    dataPathLabel.append(dataPathInput, createNote('Accepts an absolute path or a slides-repo-relative path.'));
+    paramsShell.append(dataPathLabel);
 
     card.append(topLine, summary, grid, paramsShell);
     entryList.append(card);
@@ -721,7 +733,7 @@ function exportSecrets() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// WebGPU Preview (requires vzglyd_web built separately — not embedded in native)
+// Native-only display status
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function previewSlide(index) {
@@ -732,7 +744,7 @@ function previewSlide(index) {
   if (!entry?.path) return;
 
   previewLabel.textContent = `Preview: ${entry.bundle_manifest?.name ?? entry.path}`;
-  previewStatus.textContent = 'Preview requires the web build. Run wasm-pack in VRX-64-web and rebuild.';
+  previewStatus.textContent = 'Native VRX-64 no longer ships a web preview. Use data_path to point this slide at a watched result file.';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

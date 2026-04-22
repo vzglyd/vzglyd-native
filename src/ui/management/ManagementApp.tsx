@@ -71,7 +71,7 @@ const markup = String.raw`
     <div class="card">
       <div class="card-head">
         <div><h2>Secrets</h2><p class="hint">API keys for slides. Never exposed in logs.</p></div>
-        <button class="secondary-btn" id="export-secrets-btn" title="Download secrets.json for use with the web editor">Export secrets.json</button>
+        <button class="secondary-btn" id="export-secrets-btn" title="Download secrets.json for the native runtime">Export secrets.json</button>
       </div>
       <div class="secrets-warning">
         ⚠ Do not commit <code>secrets.json</code> to a public repository.
@@ -94,14 +94,14 @@ const markup = String.raw`
 
   <!-- Right panel: preview placeholder -->
   <div id="right-panel">
-    <p id="preview-label">Select a slide to preview</p>
+    <p id="preview-label">Select a slide to inspect</p>
     <div id="preview-placeholder" style="
       width: 640px; max-width: 100%; aspect-ratio: 640/480;
       display: flex; align-items: center; justify-content: center;
       border: 1px solid var(--border); border-radius: 8px;
       background: var(--surface); color: var(--text-dim);
       font-size: 0.9rem; text-align: center; padding: 1rem;
-    ">Live preview requires<br/>the VRX-64-web build</div>
+    ">Native-first runtime<br/>watches JSON result files</div>
     <p id="preview-status"></p>
   </div>
 </div>

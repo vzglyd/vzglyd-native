@@ -28,7 +28,6 @@ incremental = false
 # Kernel crates
 vzglyd_kernel = { package = "VRX-64-kernel", git = "https://github.com/vzglyd/VRX-64-kernel", branch = "main" }
 vzglyd_slide = { package = "VRX-64-slide", git = "https://github.com/vzglyd/VRX-64-slide", branch = "main", features = ["gpu"] }
-vzglyd_sidecar = { package = "VRX-64-sidecar", git = "https://github.com/vzglyd/VRX-64-sidecar", branch = "main" }
 
 # Windowing
 winit = "0.30"

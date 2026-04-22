@@ -1110,15 +1110,18 @@ fn create_static_mesh_buffers<V: Pod>(device: &wgpu::Device, mesh: &StaticMesh<V
 }
 
 /// Creates scene mesh buffers with u32 indices for large meshes.
-fn create_scene_mesh_buffers<V: Pod>(device: &wgpu::Device, vertices: &[V], indices: &[u32]) -> MeshBuffers {
+fn create_scene_mesh_buffers<V: Pod>(
+    device: &wgpu::Device,
+    vertices: &[V],
+    indices: &[u32],
+) -> MeshBuffers {
     let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scene_vertex_buffer"),
         size: vertices.len() as u64 * std::mem::size_of::<V>() as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    vertex_buffer.slice(..).get_mapped_range_mut()
-        [..vertices.len() * std::mem::size_of::<V>()]
+    vertex_buffer.slice(..).get_mapped_range_mut()[..vertices.len() * std::mem::size_of::<V>()]
         .copy_from_slice(bytemuck::cast_slice(vertices));
     vertex_buffer.unmap();
 
@@ -1829,29 +1832,19 @@ pub(crate) fn load_wasm_slide_with_engine(
     params_bytes: Option<&[u8]>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
-    load_wasm_slide_with_engine_and_sidecar_params(
-        engine,
-        path,
-        params_bytes,
-        params_bytes,
-        extra_env,
-    )
+    load_wasm_slide_with_engine_and_data_path(engine, path, params_bytes, None, extra_env)
 }
 
-pub(crate) fn load_wasm_slide_with_engine_and_sidecar_params(
+pub(crate) fn load_wasm_slide_with_engine_and_data_path(
     engine: &wasmtime::Engine,
     path: &str,
     slide_params_bytes: Option<&[u8]>,
-    sidecar_params_bytes: Option<&[u8]>,
+    data_path: Option<&str>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
-    if let Ok((slide, manifest)) = load_screen_wasm_slide(
-        engine,
-        path,
-        slide_params_bytes,
-        sidecar_params_bytes,
-        extra_env,
-    ) {
+    if let Ok((slide, manifest)) =
+        load_screen_wasm_slide(engine, path, slide_params_bytes, data_path, extra_env)
+    {
         if let LoadedSlide::Screen(screen) = &slide {
             if screen.spec.scene_space == SceneSpace::Screen2D && screen.spec.validate().is_ok() {
                 return Ok((slide, Some(manifest)));
@@ -1863,7 +1856,7 @@ pub(crate) fn load_wasm_slide_with_engine_and_sidecar_params(
         engine,
         path,
         slide_params_bytes,
-        sidecar_params_bytes,
+        data_path,
         extra_env,
     )?;
     Ok((
@@ -1881,14 +1874,14 @@ fn load_screen_wasm_slide(
     engine: &wasmtime::Engine,
     path: &str,
     slide_params_bytes: Option<&[u8]>,
-    sidecar_params_bytes: Option<&[u8]>,
+    data_path: Option<&str>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSlide, SlideManifest), LoadError> {
     let (loaded, manifest) = load_spec_with_manifest::<ScreenVertex>(
         engine,
         path,
         slide_params_bytes,
-        sidecar_params_bytes,
+        data_path,
         extra_env,
     )?;
     Ok((
@@ -1905,7 +1898,7 @@ fn load_spec_with_manifest<V>(
     engine: &wasmtime::Engine,
     path: &str,
     slide_params_bytes: Option<&[u8]>,
-    sidecar_params_bytes: Option<&[u8]>,
+    data_path: Option<&str>,
     extra_env: &[(String, String)],
 ) -> Result<(slide_loader::LoadedSpec<V>, SlideManifest), LoadError>
 where
@@ -1914,22 +1907,32 @@ where
     if Path::new(path).extension().and_then(|ext| ext.to_str())
         == Some(slide_loader::PACKAGE_ARCHIVE_EXTENSION)
     {
-        slide_loader::load_slide_from_archive_with_engine_and_sidecar_params(
+        slide_loader::load_slide_from_archive_with_engine_and_data_path(
             engine,
             path,
             slide_params_bytes,
-            sidecar_params_bytes,
+            data_path,
             extra_env,
         )
     } else {
-        slide_loader::load_slide_from_wasm_with_engine_and_sidecar_params(
+        slide_loader::load_slide_from_wasm_with_engine_and_data_path(
             engine,
             path,
             slide_params_bytes,
-            sidecar_params_bytes,
+            data_path,
             extra_env,
         )
     }
+}
+
+pub(crate) fn load_wasm_slide_with_engine_and_sidecar_params(
+    engine: &wasmtime::Engine,
+    path: &str,
+    slide_params_bytes: Option<&[u8]>,
+    _sidecar_params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSlide, Option<SlideManifest>), LoadError> {
+    load_wasm_slide_with_engine_and_data_path(engine, path, slide_params_bytes, None, extra_env)
 }
 
 /// Creates a slide renderer based on the scene space.

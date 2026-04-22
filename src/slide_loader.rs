@@ -19,7 +19,6 @@ use vzglyd_kernel::{
     ImportedCameraProjection, ImportedMesh, ImportedScene, ImportedSceneCamera,
     ImportedSceneDirectionalLight, ImportedSceneMeshNode, ImportedVertex,
 };
-use vzglyd_sidecar::host_request;
 use vzglyd_slide::{
     AnimationChannel, AnimationClip, AnimationPath, CameraKeyframe, CameraPath, DirectionalLight,
     DrawSource, DrawSpec, FilterMode, Limits, MeshAsset, MeshAssetVertex, PipelineKind,
@@ -118,13 +117,6 @@ impl SlideMailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.latest = Some(bytes);
         state.dirty = true;
-    }
-
-    fn mark_network_request(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.last_network_request_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -139,8 +131,8 @@ impl SlideMailbox {
     }
 }
 
-/// A byte-message mailbox shared between a sidecar WASM thread and the main slide.
-/// The sidecar overwrites the latest payload; the main slide consumes it once.
+/// A byte-message mailbox shared between a host data source and the main slide.
+/// The host overwrites the latest payload; the main slide consumes it once.
 type SlideChannel = Arc<SlideMailbox>;
 type SidecarRequestExecutor = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
 
@@ -164,6 +156,11 @@ struct SidecarStore {
     request_executor: SidecarRequestExecutor,
     trace_recorder: Option<TraceRecorder>,
     trace_thread: String,
+}
+
+struct DataSourceHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +311,7 @@ impl PackageMeshVertex for ScreenVertex {
     }
 }
 
+#[derive(Debug)]
 pub struct PackReport {
     pub output_path: PathBuf,
     pub content_bytes: u64,
@@ -340,6 +338,8 @@ pub(crate) struct SlideRuntime {
     dynamic_meshes_ptr: Option<RuntimeI32Func0>,
     dynamic_meshes_len: Option<RuntimeI32Func0>,
     #[allow(dead_code)]
+    data_source: Option<DataSourceHandle>,
+    #[allow(dead_code)]
     sidecar: Option<SidecarHandle>,
 }
 
@@ -349,6 +349,15 @@ type RuntimeI32Func0 = TypedFunc<(), i32>;
 
 struct SidecarHandle {
     _thread: std::thread::JoinHandle<()>,
+}
+
+impl Drop for DataSourceHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,8 +400,25 @@ impl SlideRuntime {
             overlay_len,
             dynamic_meshes_ptr,
             dynamic_meshes_len,
+            data_source: None,
             sidecar: None,
         }
+    }
+
+    fn attach_data_source(&mut self, data_source: DataSourceHandle) {
+        log::info!(
+            "slide:{} attached host data source",
+            self.store.data().label
+        );
+        if let Some(recorder) = self.store.data().trace_recorder.clone() {
+            recorder.instant(
+                self.store.data().trace_thread.clone(),
+                "lifecycle",
+                "attach_data_source",
+                BTreeMap::new(),
+            );
+        }
+        self.data_source = Some(data_source);
     }
 
     fn attach_sidecar(&mut self, sidecar: SidecarHandle) {
@@ -721,7 +747,7 @@ fn host_channel_poll(
         }
 
         log::info!(
-            "slide:{} consumed {} sidecar bytes: {}",
+            "slide:{} consumed {} host data bytes: {}",
             caller.data().label,
             msg.len(),
             preview_bytes(msg, 160)
@@ -887,10 +913,84 @@ fn read_guest_bytes<T>(
         .ok_or(WASI_ERRNO_FAULT)
 }
 
-fn default_sidecar_request_executor() -> SidecarRequestExecutor {
-    Arc::new(|request_bytes| {
-        host_request::execute_request_bytes(request_bytes).map_err(|error| error.to_string())
+fn spawn_data_source(
+    path: &Path,
+    tx: SlideChannel,
+    runtime_label: &str,
+) -> Result<DataSourceHandle, LoadError> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    let path = path.to_path_buf();
+    let label = runtime_label.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("VRX-64-data-source".into())
+        .spawn(move || {
+            let mut last_observed: Option<Vec<u8>> = None;
+            let mut last_missing = false;
+            let mut last_error = None::<String>;
+            while !stop_thread.load(Ordering::Acquire) {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        last_missing = false;
+                        last_error = None;
+                        if last_observed.as_ref() != Some(&bytes) {
+                            last_observed = Some(bytes.clone());
+                            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                Ok(_) => {
+                                    log::info!(
+                                        "slide:{label} consumed watched data '{}' ({} bytes)",
+                                        path.display(),
+                                        bytes.len()
+                                    );
+                                    tx.push_latest(bytes);
+                                }
+                                Err(error) => {
+                                    log::warn!(
+                                        "slide:{label} ignored invalid JSON from '{}': {error}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        last_observed = None;
+                        if !last_missing {
+                            log::warn!(
+                                "slide:{label} waiting for watched data '{}'",
+                                path.display()
+                            );
+                            last_missing = true;
+                        }
+                    }
+                    Err(error) => {
+                        last_observed = None;
+                        let message = error.to_string();
+                        if last_error.as_deref() != Some(message.as_str()) {
+                            log::warn!(
+                                "slide:{label} failed to read watched data '{}': {message}",
+                                path.display()
+                            );
+                            last_error = Some(message);
+                        }
+                    }
+                }
+
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        })
+        .map_err(|error| LoadError::WasmLoad(error.to_string()))?;
+
+    Ok(DataSourceHandle {
+        stop,
+        thread: Some(thread),
     })
+}
+
+fn default_sidecar_request_executor() -> SidecarRequestExecutor {
+    Arc::new(|_request_bytes| Err("VRX-64 sidecars are no longer supported".to_string()))
 }
 
 #[cfg(test)]
@@ -1241,7 +1341,6 @@ fn run_sidecar_module(
                     Ok(bytes) => bytes,
                     Err(_) => return HOST_ERROR,
                 };
-                caller.data().tx.mark_network_request();
                 let mut trace = caller.data().trace_recorder.clone().map(|recorder| {
                     let mut span = recorder.scoped(
                         caller.data().trace_thread.clone(),
@@ -2662,20 +2761,14 @@ pub(crate) fn load_slide_from_wasm_with_engine<V>(
 where
     V: PackageMeshVertex,
 {
-    load_slide_from_wasm_with_engine_and_sidecar_params(
-        engine,
-        wasm_path,
-        params_bytes,
-        params_bytes,
-        extra_env,
-    )
+    load_slide_from_wasm_with_engine_and_data_path(engine, wasm_path, params_bytes, None, extra_env)
 }
 
-pub(crate) fn load_slide_from_wasm_with_engine_and_sidecar_params<V>(
+pub(crate) fn load_slide_from_wasm_with_engine_and_data_path<V>(
     engine: &Engine,
     wasm_path: &str,
     slide_params_bytes: Option<&[u8]>,
-    sidecar_params_bytes: Option<&[u8]>,
+    data_path: Option<&str>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
 where
@@ -2687,6 +2780,10 @@ where
     let phase_started = Instant::now();
     let entry = resolve_runtime_entry_paths(wasm_path)?;
     log_phase_duration(wasm_path, "resolve_entry", phase_started);
+    let sidecar_path = entry.package_root.join(PACKAGE_SIDECAR_NAME);
+    if sidecar_path.is_file() {
+        return Err(unsupported_sidecar_bundle(&sidecar_path));
+    }
 
     let phase_started = Instant::now();
     let meta = std::fs::metadata(&entry.wasm_path)
@@ -2791,44 +2888,42 @@ where
     .then_some(ShaderSourceHint::DefaultWorldScene);
     loaded.screen_background_scene = screen_background_scene;
 
-    let sidecar_path = entry.package_root.join(PACKAGE_SIDECAR_NAME);
-    if sidecar_path.is_file() {
+    if let Some(data_path) = data_path {
         let phase_started = Instant::now();
-        let sidecar_bytes = std::fs::read(&sidecar_path).map_err(|error| {
-            LoadError::WasmLoad(format!(
-                "failed to read sidecar '{}': {error}",
-                sidecar_path.display()
-            ))
-        })?;
-        let sidecar_preopens = manifest
-            .sidecar
-            .as_ref()
-            .map(|sidecar| sidecar.wasi_preopens.clone())
-            .unwrap_or_default();
-        let sidecar_runtime_label = sidecar_path.display().to_string();
-        let sidecar = load_sidecar_with_config(
-            engine,
-            &sidecar_bytes,
-            channel,
-            &sidecar_preopens,
-            &sidecar_runtime_label,
-            sidecar_params_bytes,
-            extra_env,
-        )?;
+        let data_source = spawn_data_source(Path::new(data_path), channel, &slide_runtime_label)?;
         if let Some(runtime) = loaded.runtime.as_mut() {
-            runtime.attach_sidecar(sidecar);
+            runtime.attach_data_source(data_source);
         } else {
             log::warn!(
-                "slide '{}' bundled '{}' but does not expose a runtime; sidecar ignored",
+                "slide '{}' configured watched data '{}' but does not expose a runtime; data source ignored",
                 entry.wasm_path.display(),
-                sidecar_path.display()
+                data_path
             );
         }
-        log_phase_duration(&slide_runtime_label, "sidecar", phase_started);
+        log_phase_duration(&slide_runtime_label, "data_source", phase_started);
     }
 
     log_phase_duration(&slide_runtime_label, "total_slide_load", total_started);
     Ok((loaded, manifest))
+}
+
+pub(crate) fn load_slide_from_wasm_with_engine_and_sidecar_params<V>(
+    engine: &Engine,
+    wasm_path: &str,
+    slide_params_bytes: Option<&[u8]>,
+    _sidecar_params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
+where
+    V: PackageMeshVertex,
+{
+    load_slide_from_wasm_with_engine_and_data_path(
+        engine,
+        wasm_path,
+        slide_params_bytes,
+        None,
+        extra_env,
+    )
 }
 
 #[cfg(test)]
@@ -2854,20 +2949,20 @@ pub(crate) fn load_slide_from_archive_with_engine<V>(
 where
     V: PackageMeshVertex,
 {
-    load_slide_from_archive_with_engine_and_sidecar_params(
+    load_slide_from_archive_with_engine_and_data_path(
         engine,
         archive_path,
         params_bytes,
-        params_bytes,
+        None,
         extra_env,
     )
 }
 
-pub(crate) fn load_slide_from_archive_with_engine_and_sidecar_params<V>(
+pub(crate) fn load_slide_from_archive_with_engine_and_data_path<V>(
     engine: &Engine,
     archive_path: &str,
     slide_params_bytes: Option<&[u8]>,
-    sidecar_params_bytes: Option<&[u8]>,
+    data_path: Option<&str>,
     extra_env: &[(String, String)],
 ) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
 where
@@ -2878,11 +2973,30 @@ where
             "'{archive_path}' is not a .{PACKAGE_ARCHIVE_EXTENSION} archive"
         )));
     }
-    load_slide_from_wasm_with_engine_and_sidecar_params(
+    load_slide_from_wasm_with_engine_and_data_path(
         engine,
         archive_path,
         slide_params_bytes,
-        sidecar_params_bytes,
+        data_path,
+        extra_env,
+    )
+}
+
+pub(crate) fn load_slide_from_archive_with_engine_and_sidecar_params<V>(
+    engine: &Engine,
+    archive_path: &str,
+    slide_params_bytes: Option<&[u8]>,
+    _sidecar_params_bytes: Option<&[u8]>,
+    extra_env: &[(String, String)],
+) -> Result<(LoadedSpec<V>, SlideManifest), LoadError>
+where
+    V: PackageMeshVertex,
+{
+    load_slide_from_archive_with_engine_and_data_path(
+        engine,
+        archive_path,
+        slide_params_bytes,
+        None,
         extra_env,
     )
 }
@@ -3063,10 +3177,10 @@ fn collect_pack_files(
         asset_loader.resolve(PACKAGE_WASM_NAME)?,
     );
     if package_root.join(PACKAGE_SIDECAR_NAME).is_file() {
-        files.insert(
-            PathBuf::from(PACKAGE_SIDECAR_NAME),
-            asset_loader.resolve(PACKAGE_SIDECAR_NAME)?,
-        );
+        return Err(LoadError::Archive(
+            "sidecar.wasm is no longer supported; move acquisition into brrmmmm and point playlist data_path at the result file"
+                .to_string(),
+        ));
     }
 
     if let Some(assets) = manifest.assets.as_ref() {
@@ -3380,13 +3494,28 @@ fn archive_cache_key(archive_path: &Path) -> Result<String, LoadError> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+fn unsupported_sidecar_bundle(path: &Path) -> LoadError {
+    LoadError::WasmLoad(format!(
+        "unsupported legacy sidecar '{}': sidecar.wasm is no longer supported; move acquisition into brrmmmm and point playlist data_path at the result file",
+        path.display()
+    ))
+}
+
 pub(crate) fn load_manifest(manifest_path: &Path) -> Result<SlideManifest, LoadError> {
     let manifest_path_buf = manifest_path.to_path_buf();
     let manifest_path = manifest_path_buf.to_string_lossy().to_string();
     let manifest_str = std::fs::read_to_string(&manifest_path)
         .map_err(|_| LoadError::MissingManifest(manifest_path.clone()))?;
-    let manifest: SlideManifest =
+    let manifest_value: serde_json::Value =
         serde_json::from_str(&manifest_str).map_err(|e| LoadError::ManifestParse(e.to_string()))?;
+    if manifest_value.get("sidecar").is_some() {
+        return Err(LoadError::ManifestValidation(
+            "manifest.sidecar is no longer supported; use playlist data_path with a brrmmmm result file"
+                .to_string(),
+        ));
+    }
+    let manifest: SlideManifest = serde_json::from_value(manifest_value)
+        .map_err(|e| LoadError::ManifestParse(e.to_string()))?;
     manifest
         .validate(vzglyd_slide::ABI_VERSION)
         .map_err(|e| LoadError::ManifestValidation(e.to_string()))?;
@@ -4133,7 +4262,7 @@ mod tests {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use vzglyd_slide::{
         DrawSource, DrawSpec, Limits, PipelineKind, SceneAnchorSet, SceneSpace, SlideSpec,
         SpecError, StaticMesh,
@@ -4182,6 +4311,33 @@ mod tests {
         std::fs::write(art_dir.join("j-card.png"), b"j-card").expect("write j-card art");
         std::fs::write(art_dir.join("side-a.png"), b"side-a").expect("write side A art");
         std::fs::write(art_dir.join("side-b.png"), b"side-b").expect("write side B art");
+    }
+
+    fn latest_channel_payload(channel: &SlideChannel) -> Option<Vec<u8>> {
+        channel
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest
+            .clone()
+    }
+
+    fn wait_for_channel_payload(channel: &SlideChannel, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if latest_channel_payload(channel).as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for channel payload {:?}, latest was {:?}",
+                String::from_utf8_lossy(expected),
+                latest_channel_payload(channel)
+                    .as_deref()
+                    .map(String::from_utf8_lossy)
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn manifest_with_required_art(manifest: &str) -> String {
@@ -4870,6 +5026,63 @@ mod tests {
         wat::parse_str(&wat_src).expect("compile channel poll runtime WAT to WASM")
     }
 
+    #[test]
+    fn watched_data_source_loads_initial_json_and_updates_on_atomic_replace() {
+        let package_dir = temp_package_dir("watched_data_source_replace");
+        let data_path = package_dir.join("weather.out.json");
+        std::fs::write(&data_path, br#"{"temp_c":18}"#).expect("write initial watched data");
+        let channel: SlideChannel = Arc::new(SlideMailbox::new());
+
+        let _handle = spawn_data_source(&data_path, Arc::clone(&channel), "watched-data-test")
+            .expect("spawn watched data source");
+
+        wait_for_channel_payload(&channel, br#"{"temp_c":18}"#);
+
+        let replacement = package_dir.join("weather.out.json.tmp");
+        std::fs::write(&replacement, br#"{"temp_c":21}"#).expect("write replacement payload");
+        std::fs::rename(&replacement, &data_path).expect("atomically replace watched data");
+
+        wait_for_channel_payload(&channel, br#"{"temp_c":21}"#);
+        assert!(channel.last_network_request_unix_secs().is_some());
+
+        let _ = std::fs::remove_dir_all(&package_dir);
+    }
+
+    #[test]
+    fn watched_data_source_keeps_last_good_payload_across_invalid_and_missing_files() {
+        let package_dir = temp_package_dir("watched_data_source_resilience");
+        let data_path = package_dir.join("weather.out.json");
+        std::fs::write(&data_path, br#"{"temp_c":18}"#).expect("write initial watched data");
+        let channel: SlideChannel = Arc::new(SlideMailbox::new());
+
+        let _handle = spawn_data_source(&data_path, Arc::clone(&channel), "watched-data-test")
+            .expect("spawn watched data source");
+
+        wait_for_channel_payload(&channel, br#"{"temp_c":18}"#);
+
+        std::fs::write(&data_path, b"{").expect("write invalid json");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            latest_channel_payload(&channel).as_deref(),
+            Some(br#"{"temp_c":18}"#.as_slice())
+        );
+
+        std::fs::remove_file(&data_path).expect("remove watched data");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            latest_channel_payload(&channel).as_deref(),
+            Some(br#"{"temp_c":18}"#.as_slice())
+        );
+
+        let replacement = package_dir.join("weather.out.json.tmp");
+        std::fs::write(&replacement, br#"{"temp_c":24}"#).expect("write replacement payload");
+        std::fs::rename(&replacement, &data_path).expect("restore watched data");
+
+        wait_for_channel_payload(&channel, br#"{"temp_c":24}"#);
+
+        let _ = std::fs::remove_dir_all(&package_dir);
+    }
+
     fn make_sidecar_push_test_wasm(message: &[u8]) -> Vec<u8> {
         let escaped_message: String = message.iter().map(|byte| format!("\\{byte:02x}")).collect();
         let len = message.len();
@@ -5121,30 +5334,15 @@ mod tests {
     #[test]
     fn sidecar_network_requests_roundtrip_through_host_executor() {
         let engine = make_wasm_engine().expect("build test engine");
-        let request = host_request::HostRequest::HttpsGet {
-            host: "air-quality-api.open-meteo.com".to_string(),
-            path: "/v1/air-quality?latitude=-37.2452&longitude=144.4614&current=european_aqi"
-                .to_string(),
-            headers: Vec::new(),
-        };
-        let request_bytes = host_request::encode_request(&request).expect("encode request");
+        let request_bytes = br#"{"request":"air-quality"}"#.to_vec();
         let wasm = make_network_request_sidecar_test_wasm(&request_bytes);
         let module = Module::new(&engine, &wasm).expect("compile sidecar module");
         let channel: SlideChannel = Arc::new(SlideMailbox::new());
-        let expected_response = host_request::encode_response(&host_request::HostResponse::Http {
-            status_code: 200,
-            headers: vec![host_request::Header {
-                name: "etag".to_string(),
-                value: "\"air-quality\"".to_string(),
-            }],
-            body: br#"{"current":{"european_aqi":42}}"#.to_vec(),
-        })
-        .expect("encode response");
+        let expected_response = br#"{"current":{"european_aqi":42}}"#.to_vec();
         let expected_response_clone = expected_response.clone();
-        let expected_request = request.clone();
+        let expected_request = request_bytes.clone();
         let request_executor: SidecarRequestExecutor = Arc::new(move |bytes| {
-            let decoded = host_request::decode_request(bytes).map_err(|error| error.to_string())?;
-            assert_eq!(decoded, expected_request);
+            assert_eq!(bytes, expected_request.as_slice());
             Ok(expected_response_clone.clone())
         });
 
@@ -5726,7 +5924,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_slide_directory_runs_build_script_before_archiving() {
+    fn pack_slide_directory_rejects_sidecar_generated_by_build_script() {
         let package_dir = temp_package_dir("pack_build_script");
         let built_dir = package_dir.join("built");
         std::fs::create_dir_all(&built_dir).expect("create built dir");
@@ -5756,34 +5954,12 @@ cp built/sidecar.wasm sidecar.wasm
         std::fs::write(package_dir.join("build.sh"), build_script).expect("write build script");
 
         let archive_path = package_dir.join("built.vzglyd");
-        pack_slide_directory(&package_dir, &archive_path).expect("pack archive");
-
-        let archive_file = File::open(&archive_path).expect("open archive");
-        let mut archive = ZipArchive::new(archive_file).expect("read zip archive");
-
-        let mut archived_manifest = String::new();
-        archive
-            .by_name(PACKAGE_MANIFEST_NAME)
-            .expect("manifest entry")
-            .read_to_string(&mut archived_manifest)
-            .expect("read archived manifest");
-        assert!(archived_manifest.contains("\"Built Package\""));
-
-        let mut archived_wasm = Vec::new();
-        archive
-            .by_name(PACKAGE_WASM_NAME)
-            .expect("slide entry")
-            .read_to_end(&mut archived_wasm)
-            .expect("read archived wasm");
-        assert_eq!(archived_wasm, wasm);
-
-        let mut archived_sidecar = Vec::new();
-        archive
-            .by_name(PACKAGE_SIDECAR_NAME)
-            .expect("sidecar entry")
-            .read_to_end(&mut archived_sidecar)
-            .expect("read archived sidecar");
-        assert_eq!(archived_sidecar, sidecar);
+        let error = pack_slide_directory(&package_dir, &archive_path).expect_err("sidecar");
+        assert!(
+            error
+                .to_string()
+                .contains("sidecar.wasm is no longer supported")
+        );
     }
 
     #[test]
