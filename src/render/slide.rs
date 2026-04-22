@@ -118,6 +118,7 @@ pub struct LoadedScreenSlide {
 
 pub struct LoadedWorldSlide {
     pub spec: SlideSpec<WorldVertex>,
+    pub(crate) scene_meshes: Vec<slide_loader::NativeSceneMesh>,
     pub(crate) runtime: Option<slide_loader::SlideRuntime>,
     pub(crate) shader_source_hint: Option<slide_loader::ShaderSourceHint>,
 }
@@ -316,6 +317,7 @@ impl ScreenSlideRenderer {
                     ctx,
                     LoadedWorldSlide {
                         spec: scene.spec,
+                        scene_meshes: scene.scene_meshes,
                         runtime: None,
                         shader_source_hint: scene.shader_source_hint,
                     },
@@ -506,6 +508,7 @@ impl WorldSlideRenderer {
             ctx,
             LoadedWorldSlide {
                 spec,
+                scene_meshes: Vec::new(),
                 runtime: None,
                 shader_source_hint: None,
             },
@@ -515,6 +518,7 @@ impl WorldSlideRenderer {
     fn from_loaded(ctx: &GpuContext, loaded: LoadedWorldSlide) -> Result<Self, String> {
         let LoadedWorldSlide {
             spec,
+            scene_meshes,
             runtime,
             shader_source_hint,
         } = loaded;
@@ -531,11 +535,24 @@ impl WorldSlideRenderer {
             )?);
         }
 
-        // Create static meshes
+        // Create static meshes from spec, replacing authored scene placeholders
+        // with native u32 scene mesh buffers at the same draw slots.
         let static_meshes: Vec<MeshBuffers> = spec
             .static_meshes
             .iter()
-            .map(|mesh| create_static_mesh_buffers(&ctx.device, mesh))
+            .enumerate()
+            .map(|(mesh_index, mesh)| {
+                scene_meshes.get(mesh_index).map_or_else(
+                    || create_static_mesh_buffers(&ctx.device, mesh),
+                    |scene_mesh| {
+                        create_scene_mesh_buffers(
+                            &ctx.device,
+                            &scene_mesh.vertices,
+                            &scene_mesh.indices,
+                        )
+                    },
+                )
+            })
             .collect();
 
         // Create dynamic mesh buffers
@@ -1076,19 +1093,49 @@ fn create_static_mesh_buffers<V: Pod>(device: &wgpu::Device, mesh: &StaticMesh<V
 
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("static_index_buffer"),
-        size: mesh.indices.len() as u64 * std::mem::size_of::<u32>() as u64,
+        size: mesh.indices.len() as u64 * 4,
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    index_buffer.slice(..).get_mapped_range_mut()
-        [..mesh.indices.len() * std::mem::size_of::<u32>()]
-        .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
+    let indices_u32: Vec<u32> = mesh.indices.iter().map(|&i| i as u32).collect();
+    index_buffer.slice(..).get_mapped_range_mut()[..indices_u32.len() * 4]
+        .copy_from_slice(bytemuck::cast_slice(&indices_u32));
     index_buffer.unmap();
 
     MeshBuffers {
         vertex_buffer: Arc::new(vertex_buffer),
         index_buffer: Arc::new(index_buffer),
         index_count: mesh.indices.len() as u32,
+    }
+}
+
+/// Creates scene mesh buffers with u32 indices for large meshes.
+fn create_scene_mesh_buffers<V: Pod>(device: &wgpu::Device, vertices: &[V], indices: &[u32]) -> MeshBuffers {
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("scene_vertex_buffer"),
+        size: vertices.len() as u64 * std::mem::size_of::<V>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    vertex_buffer.slice(..).get_mapped_range_mut()
+        [..vertices.len() * std::mem::size_of::<V>()]
+        .copy_from_slice(bytemuck::cast_slice(vertices));
+    vertex_buffer.unmap();
+
+    let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("scene_index_buffer"),
+        size: indices.len() as u64 * 4,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    index_buffer.slice(..).get_mapped_range_mut()[..indices.len() * 4]
+        .copy_from_slice(bytemuck::cast_slice(indices));
+    index_buffer.unmap();
+
+    MeshBuffers {
+        vertex_buffer: Arc::new(vertex_buffer),
+        index_buffer: Arc::new(index_buffer),
+        index_count: indices.len() as u32,
     }
 }
 
@@ -1109,13 +1156,13 @@ fn create_dynamic_mesh_buffers(
 
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dynamic_index_buffer"),
-        size: index_capacity as u64 * std::mem::size_of::<u32>() as u64,
+        size: index_capacity as u64 * 4,
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: true,
     });
-    index_buffer.slice(..).get_mapped_range_mut()
-        [..mesh.indices.len() * std::mem::size_of::<u32>()]
-        .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
+    let indices_u32: Vec<u32> = mesh.indices.iter().map(|&i| i as u32).collect();
+    index_buffer.slice(..).get_mapped_range_mut()[..indices_u32.len() * 4]
+        .copy_from_slice(bytemuck::cast_slice(&indices_u32));
     index_buffer.unmap();
 
     DynamicMeshBuffers {
@@ -1535,7 +1582,7 @@ fn create_slide_pipelines(
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
+                    cull_mode: None,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -1579,7 +1626,7 @@ fn create_slide_pipelines(
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
+                    cull_mode: None,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -1822,6 +1869,7 @@ pub(crate) fn load_wasm_slide_with_engine_and_sidecar_params(
     Ok((
         LoadedSlide::World(LoadedWorldSlide {
             spec: loaded.spec,
+            scene_meshes: loaded.scene_meshes,
             runtime: loaded.runtime,
             shader_source_hint: loaded.shader_source_hint,
         }),

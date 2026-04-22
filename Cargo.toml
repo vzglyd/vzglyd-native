@@ -82,8 +82,5 @@ drm = "0.15"
 [build-dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-[patch."https://github.com/vzglyd/VRX-64-kernel"]
-"VRX-64-kernel" = { path = "../VRX-64-kernel" }
-
 [dev-dependencies]
 wat = "1"

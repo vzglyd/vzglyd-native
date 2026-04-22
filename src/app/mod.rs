@@ -1382,7 +1382,7 @@ fn schedule_snapshot(engine: &Engine) -> Vec<ScheduledSlide> {
         .map(|entry: &SlideEntry| ScheduledSlide {
             path: entry.path.clone(),
             params: entry.params.clone(),
-            sidecar_params: entry.sidecar_params.clone(),
+            sidecar_params: None,
         })
         .collect()
 }

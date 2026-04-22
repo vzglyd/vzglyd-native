@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "VRX-64-kernel"
 version = "0.1.0"
+source = "git+https://github.com/vzglyd/VRX-64-kernel?branch=main#d742c3c984f7d678573e2f612c6330c1b0a22379"
 dependencies = [
  "VRX-64-slide",
  "bytemuck",
@@ -70,7 +71,7 @@ dependencies = [
 [[package]]
 name = "VRX-64-slide"
 version = "0.1.0"
-source = "git+https://github.com/vzglyd/VRX-64-slide?branch=main#db1596768991311e95e68899fdff0f49c666f35b"
+source = "git+https://github.com/vzglyd/VRX-64-slide?branch=main#5109c8f66a16eaf8ebd8e30c2ad8dd17c765faa4"
 dependencies = [
  "bytemuck",
  "serde",

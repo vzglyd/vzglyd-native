@@ -219,10 +219,19 @@ pub(crate) enum ShaderSourceHint {
 
 pub(crate) struct ScreenBackgroundScene {
     pub spec: SlideSpec<WorldVertex>,
+    pub scene_meshes: Vec<NativeSceneMesh>,
     pub shader_source_hint: Option<ShaderSourceHint>,
 }
 
+/// Native scene mesh with u32 indices, bypassing the slide crate's u16 limitation.
+pub(crate) struct NativeSceneMesh {
+    pub vertices: Vec<WorldVertex>,
+    pub indices: Vec<u32>,
+}
+
 pub(crate) trait PackageMeshVertex: Serialize + DeserializeOwned + bytemuck::Pod {
+    const SUPPORTS_AUTHORED_WORLD_SCENE: bool = false;
+
     fn from_imported(imported: ImportedVertex, fallback: Option<&Self>) -> Self;
 
     fn from_scene_import(
@@ -233,9 +242,22 @@ pub(crate) trait PackageMeshVertex: Serialize + DeserializeOwned + bytemuck::Pod
         let _ = material_class;
         Self::from_imported(imported, fallback)
     }
+
+    fn from_native_scene_import(
+        imported: ImportedVertex,
+        material_class: SceneMaterialClass,
+        fallback: Option<&Self>,
+    ) -> Option<WorldVertex> {
+        let _ = imported;
+        let _ = material_class;
+        let _ = fallback;
+        None
+    }
 }
 
 impl PackageMeshVertex for WorldVertex {
+    const SUPPORTS_AUTHORED_WORLD_SCENE: bool = true;
+
     fn from_imported(imported: ImportedVertex, fallback: Option<&Self>) -> Self {
         let fallback_color = fallback
             .map(|vertex| vertex.color)
@@ -263,6 +285,14 @@ impl PackageMeshVertex for WorldVertex {
             color: imported.color.unwrap_or(fallback_color),
             mode: scene_material_mode(material_class),
         }
+    }
+
+    fn from_native_scene_import(
+        imported: ImportedVertex,
+        material_class: SceneMaterialClass,
+        fallback: Option<&Self>,
+    ) -> Option<WorldVertex> {
+        Some(Self::from_scene_import(imported, material_class, fallback))
     }
 }
 
@@ -295,6 +325,7 @@ pub struct LoadedSpec<V: bytemuck::Pod> {
     pub(crate) runtime: Option<SlideRuntime>,
     pub(crate) shader_source_hint: Option<ShaderSourceHint>,
     pub(crate) screen_background_scene: Option<ScreenBackgroundScene>,
+    pub(crate) scene_meshes: Vec<NativeSceneMesh>,
 }
 
 pub(crate) struct SlideRuntime {
@@ -1716,9 +1747,13 @@ impl AssetLoader {
             GlbError::ReadError(_, msg)
             | GlbError::ParseError(_, msg)
             | GlbError::FormatError(msg)
-            | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
+            | GlbError::Unsupported(msg) => LoadError::AssetLoad(format!(
+                "failed to load static mesh '{path}' ({:?}): {msg}",
+                resolved.display()
+            )),
         })?;
         let fallback = template.vertices.first();
+        let indices = imported.indices;
         Ok(StaticMesh {
             label: template.label.clone(),
             vertices: imported
@@ -1726,7 +1761,7 @@ impl AssetLoader {
                 .into_iter()
                 .map(|vertex| V::from_imported(vertex, fallback))
                 .collect(),
-            indices: imported.indices,
+            indices,
         })
     }
 
@@ -1775,7 +1810,10 @@ pub(crate) fn load_authored_scene_from_manifest(
             GlbError::ReadError(_, msg)
             | GlbError::ParseError(_, msg)
             | GlbError::FormatError(msg)
-            | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
+            | GlbError::Unsupported(msg) => LoadError::AssetLoad(format!(
+                "failed to load scene '{:?}': {msg}",
+                resolved.display()
+            )),
         })
 }
 
@@ -2081,10 +2119,16 @@ fn compile_scene_lighting(
 fn compile_authored_scene_into_spec<V>(
     spec: &mut SlideSpec<V>,
     scene: &ImportedScene,
-) -> Result<(), LoadError>
+) -> Result<Vec<NativeSceneMesh>, LoadError>
 where
     V: PackageMeshVertex,
 {
+    if !V::SUPPORTS_AUTHORED_WORLD_SCENE {
+        return Err(LoadError::AssetLoad(
+            "authored world scene compilation requires WorldVertex slide specs".into(),
+        ));
+    }
+
     let preserved_static_meshes = std::mem::take(&mut spec.static_meshes);
     let preserved_static_draws = spec
         .draws
@@ -2115,6 +2159,7 @@ where
         )));
     }
 
+    let mut scene_meshes = Vec::with_capacity(visible_mesh_nodes.len());
     let mut static_meshes = Vec::with_capacity(visible_mesh_nodes.len());
     let mut opaque_draws = Vec::new();
     let mut transparent_draws = Vec::new();
@@ -2122,21 +2167,48 @@ where
         let material_class = resolve_scene_material_class(mesh_node);
         let pipeline = resolve_scene_pipeline(&scene.id, mesh_node, material_class);
         let mesh_index = static_meshes.len();
+        // Store u32 indices in native scene mesh; the spec's StaticMesh gets a placeholder.
+        let indices_u32: Vec<u32> = mesh_node.indices.iter().copied().collect();
+        let index_count = indices_u32.len() as u32;
+        let vertices: Vec<V> = mesh_node
+            .vertices
+            .iter()
+            .copied()
+            .map(|imported| V::from_scene_import(imported, material_class, fallback_vertex))
+            .collect();
+        let native_vertices = mesh_node
+            .vertices
+            .iter()
+            .copied()
+            .map(|imported| {
+                V::from_native_scene_import(imported, material_class, fallback_vertex).ok_or_else(
+                    || {
+                        LoadError::AssetLoad(
+                            "authored world scene compilation requires WorldVertex slide specs"
+                                .into(),
+                        )
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, LoadError>>()?;
+
+        let index_count_placeholder = indices_u32.len();
+        scene_meshes.push(NativeSceneMesh {
+            vertices: native_vertices,
+            indices: indices_u32,
+        });
+
+        // Placeholder for the spec (never rendered; native mesh has the real indices)
         static_meshes.push(StaticMesh {
             label: mesh_node.label.clone(),
-            vertices: mesh_node
-                .vertices
-                .iter()
-                .copied()
-                .map(|imported| V::from_scene_import(imported, material_class, fallback_vertex))
-                .collect(),
-            indices: mesh_node.indices.clone(),
+            vertices,
+            indices: vec![0u32; index_count_placeholder],
         });
         let draw = DrawSpec {
             label: mesh_node.label.clone(),
             source: DrawSource::Static(mesh_index),
             pipeline,
-            index_range: 0..mesh_node.indices.len() as u32,
+            index_range: 0..index_count,
         };
         match pipeline {
             PipelineKind::Opaque => opaque_draws.push(draw),
@@ -2170,7 +2242,7 @@ where
     spec.lighting = compile_scene_lighting(scene, spec.lighting.as_ref());
     ensure_compiled_scene_textures(spec);
     spec.animations = convert_scene_animations(scene, &visible_mesh_nodes);
-    Ok(())
+    Ok(scene_meshes)
 }
 
 /// Convert imported GLB animation clips into slide ABI `AnimationClip` types.
@@ -2229,7 +2301,7 @@ fn maybe_compile_authored_scene<V>(
     spec: &mut SlideSpec<V>,
     manifest: &SlideManifest,
     package_root: &Path,
-) -> Result<bool, LoadError>
+) -> Result<Vec<NativeSceneMesh>, LoadError>
 where
     V: PackageMeshVertex,
 {
@@ -2238,7 +2310,10 @@ where
         .as_ref()
         .is_some_and(|assets| !assets.scenes.is_empty());
     if !has_scene_assets {
-        return Ok(false);
+        return Ok(Vec::new());
+    }
+    if !V::SUPPORTS_AUTHORED_WORLD_SCENE {
+        return Ok(Vec::new());
     }
     if manifest.scene_space.as_deref() == Some("screen_2d") {
         return Err(LoadError::AssetLoad(
@@ -2266,8 +2341,7 @@ where
         log::warn!("scene '{}': {}", scene.id, warning);
     }
 
-    compile_authored_scene_into_spec(spec, &scene)?;
-    Ok(true)
+    compile_authored_scene_into_spec(spec, &scene)
 }
 
 fn empty_world_scene_spec() -> SlideSpec<WorldVertex> {
@@ -2309,10 +2383,11 @@ fn maybe_compile_screen_background_scene(
             )
         })?;
     let mut spec = empty_world_scene_spec();
-    compile_authored_scene_into_spec(&mut spec, &scene)?;
+    let scene_meshes = compile_authored_scene_into_spec(&mut spec, &scene)?;
 
     Ok(Some(ScreenBackgroundScene {
         spec,
+        scene_meshes,
         shader_source_hint: Some(ShaderSourceHint::DefaultWorldScene),
     }))
 }
@@ -2374,7 +2449,11 @@ fn build_host_mesh_asset_catalog(
             GlbError::ReadError(_, msg)
             | GlbError::ParseError(_, msg)
             | GlbError::FormatError(msg)
-            | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
+            | GlbError::Unsupported(msg) => LoadError::AssetLoad(format!(
+                "failed to load mesh '{}' ({:?}): {msg}",
+                mesh.path,
+                resolved.display()
+            )),
         })?;
         let encoded = encode_mesh_asset(&imported)?;
         if encoded_by_key
@@ -2418,7 +2497,11 @@ fn build_host_scene_metadata_catalog(
                 GlbError::ReadError(_, msg)
                 | GlbError::ParseError(_, msg)
                 | GlbError::FormatError(msg)
-                | GlbError::Unsupported(msg) => LoadError::AssetLoad(msg),
+                | GlbError::Unsupported(msg) => LoadError::AssetLoad(format!(
+                    "failed to load scene '{}' ({:?}): {msg}",
+                    scene_ref.path,
+                    resolved.display()
+                )),
             })?;
         let runtime_key = imported.id.clone();
         let encoded = encode_scene_metadata(&imported)?;
@@ -2672,11 +2755,12 @@ where
     );
 
     let phase_started = Instant::now();
-    let scene_compiled = if loaded.spec.scene_space == SceneSpace::Screen2D {
-        false
+    let authored_scene_meshes = if loaded.spec.scene_space == SceneSpace::Screen2D {
+        vec![]
     } else {
         maybe_compile_authored_scene(&mut loaded.spec, &manifest, &entry.package_root)?
     };
+    let scene_compiled = !authored_scene_meshes.is_empty();
     log_phase_duration(
         &slide_runtime_label,
         "authored_scene_compile",
@@ -2691,6 +2775,7 @@ where
         !scene_compiled,
     )?;
     log_phase_duration(&slide_runtime_label, "resource_overrides", phase_started);
+    loaded.scene_meshes = authored_scene_meshes;
     loaded.shader_source_hint = (scene_compiled
         && loaded
             .spec
@@ -3900,6 +3985,7 @@ where
         )),
         shader_source_hint: None,
         screen_background_scene: None,
+        scene_meshes: Vec::new(),
     })
 }
 
@@ -4351,6 +4437,17 @@ mod tests {
         (offset, bin.len() - offset)
     }
 
+    fn append_u32(bin: &mut Vec<u8>, values: &[u32]) -> (usize, usize) {
+        let offset = bin.len();
+        for value in values {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        (offset, bin.len() - offset)
+    }
+
     fn vec3_bounds(points: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
         let mut min = points[0];
         let mut max = points[0];
@@ -4391,6 +4488,49 @@ mod tests {
 
     fn make_multi_node_scene_glb() -> Vec<u8> {
         make_multi_node_scene_glb_with_anchor(Some("spawn_marker"), Some("spawn"))
+    }
+
+    fn make_large_u32_scene_glb() -> Vec<u8> {
+        let positions = (0..=65_536_u32)
+            .map(|idx| [idx as f32 / 65_536.0, 0.0, (idx % 2) as f32])
+            .collect::<Vec<_>>();
+        let indices = [0_u32, 65_536, 1];
+
+        let mut bin = Vec::new();
+        let (pos_off, pos_len) = append_vec3_f32(&mut bin, &positions);
+        let (idx_off, idx_len) = append_u32(&mut bin, &indices);
+        let (min, max) = vec3_bounds(&positions);
+
+        let json = format!(
+            concat!(
+                "{{",
+                "\"asset\":{{\"version\":\"2.0\"}},",
+                "\"scene\":0,",
+                "\"scenes\":[{{\"name\":\"LargeWorldScene\",\"nodes\":[0]}}],",
+                "\"nodes\":[{{\"name\":\"LargeMesh\",\"mesh\":0,\"extras\":{{\"vzglyd_id\":\"large_mesh\"}}}}],",
+                "\"meshes\":[{{\"name\":\"LargeMesh\",\"primitives\":[{{\"attributes\":{{\"POSITION\":0}},\"indices\":1,\"mode\":4}}]}}],",
+                "\"buffers\":[{{\"byteLength\":{buffer_len}}}],",
+                "\"bufferViews\":[",
+                "{{\"buffer\":0,\"byteOffset\":{pos_off},\"byteLength\":{pos_len}}},",
+                "{{\"buffer\":0,\"byteOffset\":{idx_off},\"byteLength\":{idx_len}}}",
+                "],",
+                "\"accessors\":[",
+                "{{\"bufferView\":0,\"componentType\":5126,\"count\":65537,\"type\":\"VEC3\",\"min\":{min},\"max\":{max}}},",
+                "{{\"bufferView\":1,\"componentType\":5125,\"count\":3,\"type\":\"SCALAR\",\"min\":[0],\"max\":[65536]}}",
+                "]",
+                "}}"
+            ),
+            buffer_len = bin.len(),
+            pos_off = pos_off,
+            pos_len = pos_len,
+            idx_off = idx_off,
+            idx_len = idx_len,
+            min = vec3_json(min),
+            max = vec3_json(max),
+        )
+        .into_bytes();
+
+        encode_glb_chunks(json, bin)
     }
 
     fn make_multi_node_scene_glb_with_anchor(
@@ -5225,6 +5365,9 @@ mod tests {
         let (loaded, _) =
             load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
                 .expect("load compiled scene package");
+        assert_eq!(loaded.scene_meshes.len(), 2);
+        assert_eq!(loaded.scene_meshes[0].indices, vec![0, 1, 2]);
+        assert_eq!(loaded.scene_meshes[1].indices, vec![0, 1, 2]);
         let spec = loaded.spec;
 
         assert_eq!(
@@ -5265,6 +5408,93 @@ mod tests {
         assert_eq!(camera_path.keyframes.len(), 2);
         assert_eq!(camera_path.keyframes[0].position, [0.0, 2.0, 4.0]);
         assert_eq!(camera_path.keyframes[0].target, [0.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn screen_typed_probe_skips_authored_world_scene_compilation() {
+        let package_dir = temp_package_dir("screen_probe_world_scene");
+        let assets_dir = package_dir.join("assets");
+        std::fs::create_dir_all(&assets_dir).expect("create assets dir");
+        std::fs::write(assets_dir.join("world.glb"), make_multi_node_scene_glb())
+            .expect("write world scene");
+
+        let spec = make_scene_compile_base_spec(Limits {
+            max_vertices: 256,
+            max_indices: 512,
+            max_static_meshes: 4,
+            max_dynamic_meshes: 0,
+            max_textures: 4,
+            max_texture_bytes: 256 * 1024,
+            max_texture_dim: 512,
+        });
+        let wasm = make_spec_wasm_bytes(&make_spec_wire_bytes(&spec));
+        write_package_root(
+            &package_dir,
+            r#"{
+                "name":"Screen Probe World Scene Test",
+                "abi_version":3,
+                "scene_space":"world_3d",
+                "assets":{
+                    "scenes":[
+                        {"path":"assets/world.glb","id":"hero_world","compile_profile":"default_world"}
+                    ]
+                }
+            }"#,
+            &wasm,
+        );
+
+        let (loaded, _) =
+            load_slide_from_wasm::<ScreenVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
+                .expect("screen-typed probe should not compile authored world scenes");
+
+        assert_eq!(loaded.spec.scene_space, SceneSpace::World3D);
+        assert!(loaded.scene_meshes.is_empty());
+    }
+
+    #[test]
+    fn authored_world_scene_keeps_native_u32_indices() {
+        let package_dir = temp_package_dir("scene_compile_u32_indices");
+        let assets_dir = package_dir.join("assets");
+        std::fs::create_dir_all(&assets_dir).expect("create assets dir");
+        std::fs::write(assets_dir.join("large.glb"), make_large_u32_scene_glb())
+            .expect("write large world scene");
+
+        let spec = make_scene_compile_base_spec(Limits {
+            max_vertices: 70_000,
+            max_indices: 3,
+            max_static_meshes: 1,
+            max_dynamic_meshes: 0,
+            max_textures: 4,
+            max_texture_bytes: 256 * 1024,
+            max_texture_dim: 512,
+        });
+        let wasm = make_spec_wasm_bytes(&make_spec_wire_bytes(&spec));
+        write_package_root(
+            &package_dir,
+            r#"{
+                "name":"Scene Compile u32 Index Test",
+                "abi_version":3,
+                "scene_space":"world_3d",
+                "assets":{
+                    "scenes":[
+                        {"path":"assets/large.glb","id":"large_world","compile_profile":"default_world"}
+                    ]
+                }
+            }"#,
+            &wasm,
+        );
+
+        let (loaded, _) =
+            load_slide_from_wasm::<WorldVertex>(package_dir.to_string_lossy().as_ref(), None, &[])
+                .expect("load u32-index scene package");
+
+        assert_eq!(loaded.scene_meshes.len(), 1);
+        assert_eq!(loaded.scene_meshes[0].indices, vec![0, 65_536, 1]);
+        assert_eq!(loaded.spec.static_meshes[0].indices.len(), 3);
+        loaded
+            .spec
+            .validate()
+            .expect("u32-index scene spec placeholders should remain ABI-valid");
     }
 
     #[test]
